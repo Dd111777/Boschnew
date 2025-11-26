@@ -681,15 +681,131 @@ class CalibHybrid(nn.Module):
     def forward(self, y):
         return self.tcv(self.aff(y))
 
+class CalibSparsePerKT(nn.Module):
+    """
+    稀疏映射友好的逐 (family, time) 残差校准层
 
-def build_calib_head(kind: str, K: int) -> nn.Module:
-    """构建校准头"""
+    设计思路：
+    - 输入 y_in: (B, K, T)，来自冻结的 morph +（可选）PerFamilyHead
+    - 新表只在少数 (k,t) 有 label；
+    - 我们对每个 (k,t) 定义一个残差 delta[k,t]，但只在 allow_mask[k,t] == 1 的位置生效；
+    - 对于 allow_mask == 0 的格子，强制 y_out == y_in，不让校正层改动。
+    """
+
+    def __init__(
+        self,
+        K: int,
+        T: int,
+        allow_mask: Optional[torch.Tensor] = None,
+        init_delta: float = 0.0,
+    ):
+        super().__init__()
+        self.K = K
+        self.T = T
+
+        # 残差参数：每个 (k,t) 一个 δ[k,t]，初始为 0（即不改动基线）
+        self.delta = nn.Parameter(torch.full((K, T), float(init_delta)))
+
+        if allow_mask is None:
+            # 默认全 1：所有 (k,t) 都允许校正
+            allow_mask = torch.ones(K, T)
+        # 允许校正的位置：1 = 可调，0 = 强制只用基线预测
+        self.register_buffer("allow_mask", allow_mask.float(), persistent=False)
+
+    @torch.no_grad()
+    def set_allow_mask(self, mask: torch.Tensor):
+        """在创建之后（例如 K/T 确定后）动态更新允许校正的 (k,t) 区域"""
+        mask = mask.float()
+        if mask.shape != self.allow_mask.shape:
+            mask = mask.view_as(self.allow_mask)
+        self.allow_mask.copy_(mask)
+
+    def forward(self, y: torch.Tensor) -> torch.Tensor:
+        """
+        y: (B, K, T) 基线预测（来自 morph + 旧表先验）
+        返回: (B, K, T)，仅在 allow_mask 为 1 的 (k,t) 上添加残差
+        """
+        B, K, T = y.shape
+        assert K == self.K and T == self.T, f"Shape mismatch: y={y.shape}, calib=({self.K},{self.T})"
+        delta_eff = self.allow_mask * self.delta          # (K, T)
+        return y + delta_eff.view(1, K, T)
+
+
+class CalibSparsePerK(nn.Module):
+    """
+    稀疏映射友好的逐 family 残差校准层
+
+    - 每个 family 一个残差 δ_k，对该 family 的所有时间点统一平移；
+    - 仅在 allow_mask_k[k] == 1（该 family 在新表中至少出现过一次）时可校正。
+    """
+
+    def __init__(
+        self,
+        K: int,
+        allow_mask_k: Optional[torch.Tensor] = None,
+        init_delta: float = 0.0,
+    ):
+        super().__init__()
+        self.K = K
+        self.delta = nn.Parameter(torch.full((K,), float(init_delta)))
+
+        if allow_mask_k is None:
+            allow_mask_k = torch.ones(K)
+        self.register_buffer("allow_mask_k", allow_mask_k.float(), persistent=False)
+
+    @torch.no_grad()
+    def set_allow_mask_k(self, mask_k: torch.Tensor):
+        mask_k = mask_k.float()
+        if mask_k.shape != self.allow_mask_k.shape:
+            mask_k = mask_k.view_as(self.allow_mask_k)
+        self.allow_mask_k.copy_(mask_k)
+
+    def forward(self, y: torch.Tensor) -> torch.Tensor:
+        """
+        y: (B, K, T)
+        返回: (B, K, T)，仅在 allow_mask_k==1 的 family 上添加残差
+        """
+        B, K, T = y.shape
+        assert K == self.K, f"Shape mismatch: y={y.shape}, calib K={self.K}"
+        delta_eff = self.allow_mask_k * self.delta     # (K,)
+        return y + delta_eff.view(1, K, 1)
+
+def build_calib_head(
+    kind: str,
+    K: int,
+    T: Optional[int] = None,
+    allow_mask: Optional[torch.Tensor] = None,
+) -> nn.Module:
+    """构建校准头 / 稀疏 map 校正头"""
+
     if kind == "affine_per_channel":
+        # 原有：每个 family 一个 α/β，对全时间共享
         return CalibAffinePerChannel(K)
+
     elif kind == "time_conv":
         return CalibTimeConv(K)
+
     elif kind == "hybrid":
         return CalibHybrid(K)
+
+    # ========= 新增：稀疏 map 友好类型 =========
+    elif kind == "sparse_per_kt":
+        # 逐 (family, time) 残差，只在 allow_mask==1 的位置生效
+        if T is None:
+            raise ValueError("T must be provided for calib_head='sparse_per_kt'")
+        return CalibSparsePerKT(K, T, allow_mask=allow_mask)
+
+    elif kind == "sparse_per_k":
+        # 逐 family 残差，只在该 family 在新表中出现过时生效
+        allow_mask_k = None
+        if allow_mask is not None:
+            # 如果传进来的是 (K,T) 掩码，就在 T 维度上聚合为 (K,)
+            if allow_mask.dim() == 2:
+                allow_mask_k = (allow_mask.sum(dim=-1) > 0).float()
+            else:
+                allow_mask_k = allow_mask.float()
+        return CalibSparsePerK(K, allow_mask_k=allow_mask_k)
+
     else:
         raise ValueError(f"Unknown calib_head: {kind}")
 
@@ -1146,6 +1262,8 @@ def train_single_variant_KFOLD(
     indices = np.arange(B)
 
     fold_results = []  # 保存每折的指标等
+    with torch.no_grad():
+        global_mask_kt = (m_full.sum(dim=0) > 0).float()  # (K, T)
 
     # -------- 逐折训练 --------
     for fold, (train_idx, test_idx) in enumerate(kfold.split(indices, strata)):
@@ -1166,9 +1284,12 @@ def train_single_variant_KFOLD(
         y_test = y_full[test_idx].to(device)
         m_test = m_full[test_idx].to(device)
 
-        tvals = (tvals_full if tvals_full.dim() == 1 else tvals_full[0]).to(device)
+        tvals = tvals.to(device)
         T = len(tvals)
         K = len(fams)
+
+        # ========== 初始化模型（每折独立） ==========
+        print(f"\n[Fold {fold + 1}] Initializing models...")
 
         # ------ 初始化模型与模块 ------
         phys_F, phys_I, ion_aff_init = build_phys_from_ckpt(
