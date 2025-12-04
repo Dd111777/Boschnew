@@ -26,164 +26,176 @@ class Cfg:
     max_epochs = 300
     val_ratio = 0.1
 
-    d_model=64; nhead=4; num_layers=2; dim_ff=128; dropout=0.1
+    # 模型（F 通道默认；Ion 单独在下面通过 ion_* 指定）
+    d_model = 64
+    nhead = 4
+    num_layers = 2
+    dim_ff = 128
+    dropout = 0.1
 
+    # 优化
     lr = 1e-3
     weight_decay = 1e-3
     clip_grad_norm = 1.0
     warmup_epochs = 10
     use_cosine = True
 
+    # Ion 专用优化（通过 getattr 读取，可按需改）
+    ion_lr = 5e-4
+    ion_weight_decay = 1e-4
+    ion_huber_lambda = 0.1
+
+    # F_Flux 损失
     f_loss = "l1"
     eps_mask_F = 1e-3
     use_tv_reg_F = True
     tv_lambda_F = 1e-3
 
-    use_learnable_affine_train_I = False
-    use_affine_calibration_post = False
-    cal_reg_lambda_I = 0.0
+    # Ion_Flux 显示空间掩码阈值
     eps_mask_I = 1e-3
-    ion_use_log_mix = True
-    ion_log_ramp_start = 20
-    ion_log_ramp_end   = 80
-    ion_log_p = 2.0
+
+    # Ion log 域平移常数估计
     ion_c_quantile = 0.10
     ion_c_min = 1e-6
-    ion_weight_gamma_target = 3.5
-    ion_weight_gamma_ramp_start = 10
-    ion_weight_gamma_ramp_end   = 80
-    ion_weight_cap = 15.0
-    use_tv_reg_I = False
-    tv_lambda_I = 0.0
-    clamp_nonneg_on_export = False
+
+    # 目标 R2，用于诊断
     target_R2_F = 0.95
     target_R2_I = 0.90
+
+
 def _make_loss(name):
-    if name=="l1": return nn.L1Loss(reduction="none")
-    if name=="l2": return nn.MSELoss(reduction="none")
+    if name == "l1":
+        return nn.L1Loss(reduction="none")
+    if name == "l2":
+        return nn.MSELoss(reduction="none")
     return nn.SmoothL1Loss(reduction="none")
+
 
 def _to_serializable(x):
     import numpy as _np, torch as _t
-    if isinstance(x, (int,float,str,bool)) or x is None: return x
-    if isinstance(x, _np.integer):  return int(x)
-    if isinstance(x, _np.floating): return float(x)
-    if isinstance(x, _np.ndarray):  return x.tolist()
-    if isinstance(x, _t.Tensor):    return x.detach().cpu().tolist()
-    if isinstance(x, (list,tuple)): return [_to_serializable(i) for i in x]
-    if isinstance(x, dict):         return {k:_to_serializable(v) for k,v in x.items()}
+    if isinstance(x, (int, float, str, bool)) or x is None:
+        return x
+    if isinstance(x, _np.integer):
+        return int(x)
+    if isinstance(x, _np.floating):
+        return float(x)
+    if isinstance(x, _np.ndarray):
+        return x.tolist()
+    if isinstance(x, _t.Tensor):
+        return x.detach().cpu().tolist()
+    if isinstance(x, (list, tuple)):
+        return [_to_serializable(i) for i in x]
+    if isinstance(x, dict):
+        return {k: _to_serializable(v) for k, v in x.items()}
     return str(x)
 
-def _clean_meta(meta: dict): return {k:_to_serializable(v) for k,v in meta.items()}
+
+def _clean_meta(meta: dict):
+    return {k: _to_serializable(v) for k, v in meta.items()}
+
 
 def _meta_torchify_for_display(meta):
     m = dict(meta)
     families = m.get("families", FAMILIES)
+
     def as_vec(v, default):
         import torch as _t, numpy as _np
-        if _t.is_tensor(v): return v.float()
+        if _t.is_tensor(v):
+            return v.float()
         if isinstance(v, dict):
             return _t.tensor([float(v.get(name, default)) for name in families], dtype=_t.float32)
-        if isinstance(v, (list,tuple,_np.ndarray)):
+        if isinstance(v, (list, tuple, _np.ndarray)):
             return _t.tensor(v, dtype=_t.float32)
-        if isinstance(v, (int,float)):
-            return _t.tensor([float(v)]*len(families), dtype=_t.float32)
-        return _t.tensor([default]*len(families), dtype=_t.float32)
-    m["family_sign"]  = as_vec(m.get("family_sign", 1.0), 1.0)
+        if isinstance(v, (int, float)):
+            return _t.tensor([float(v)] * len(families), dtype=_t.float32)
+        return _t.tensor([default] * len(families), dtype=_t.float32)
+
+    m["family_sign"] = as_vec(m.get("family_sign", 1.0), 1.0)
     m["family_scale"] = as_vec(m.get("family_scale", 1.0), 1.0)
-    m["family_bias"]  = as_vec(m.get("family_bias", 0.0), 0.0)
+    m["family_bias"] = as_vec(m.get("family_bias", 0.0), 0.0)
     return m
+
 
 # ---- 可视化/指标（保持不变） ----
 def plot_timeseries_per_channel(save_dir, y_true, y_pred, mask, time_values=None, sample_ids=None, max_n=16):
     os.makedirs(os.path.join(save_dir, "timeseries"), exist_ok=True)
-    B, C, T = y_true.shape; names = FAMILIES
-    idxs = np.arange(B) if sample_ids is None else np.asarray(sample_ids); idxs = idxs[:max_n]
+    B, C, T = y_true.shape
+    names = FAMILIES
+    idxs = np.arange(B) if sample_ids is None else np.asarray(sample_ids)
+    idxs = idxs[:max_n]
     t_axis = np.asarray(time_values) if time_values is not None else np.arange(T)
     for b in idxs:
         for c in range(C):
             valid = mask[b, c].astype(bool) if mask is not None else np.ones(T, bool)
-            t = t_axis[valid]; gt = y_true[b, c, valid]; pd = y_pred[b, c, valid]
-            plt.figure(figsize=(8,3)); plt.plot(t, gt, label="GT"); plt.plot(t, pd, "--", label="Pred")
-            plt.xlabel("Time"); plt.ylabel(names[c]); plt.title(f"{names[c]}  sample#{b}"); plt.legend()
-            plt.tight_layout(); plt.savefig(os.path.join(save_dir,"timeseries",f"{names[c]}_pred_vs_gt_{b:04d}.png"), dpi=200); plt.close()
+            t = t_axis[valid]
+            gt = y_true[b, c, valid]
+            pd = y_pred[b, c, valid]
+            plt.figure(figsize=(8, 3))
+            plt.plot(t, gt, label="GT")
+            plt.plot(t, pd, "--", label="Pred")
+            plt.xlabel("Time")
+            plt.ylabel(names[c])
+            plt.title(f"{names[c]}  sample#{b}")
+            plt.legend()
+            plt.tight_layout()
+            plt.savefig(os.path.join(save_dir, "timeseries", f"{names[c]}_pred_vs_gt_{b:04d}.png"), dpi=200)
+            plt.close()
+
 
 def parity_scatter_per_channel(save_dir, y_true, y_pred, mask, suffix=""):
     os.makedirs(os.path.join(save_dir, "parity"), exist_ok=True)
-    names = FAMILIES; B, C, T = y_true.shape
+    names = FAMILIES
+    B, C, T = y_true.shape
     for c in range(C):
-        valid = mask[:, c, :].reshape(-1).astype(bool) if mask is not None else np.ones(B*T, bool)
-        gt = y_true[:, c, :].reshape(-1)[valid]; pd = y_pred[:, c, :].reshape(-1)[valid]
-        if gt.size==0: continue
-        lim_min = float(min(gt.min(), pd.min())); lim_max = float(max(gt.max(), pd.max()))
-        plt.figure(figsize=(4,4)); plt.scatter(gt, pd, s=3, alpha=0.5); plt.plot([lim_min,lim_max],[lim_min,lim_max])
+        valid = mask[:, c, :].reshape(-1).astype(bool) if mask is not None else np.ones(B * T, bool)
+        gt = y_true[:, c, :].reshape(-1)[valid]
+        pd = y_pred[:, c, :].reshape(-1)[valid]
+        if gt.size == 0:
+            continue
+        lim_min = float(min(gt.min(), pd.min()))
+        lim_max = float(max(gt.max(), pd.max()))
+        plt.figure(figsize=(4, 4))
+        plt.scatter(gt, pd, s=3, alpha=0.5)
+        plt.plot([lim_min, lim_max], [lim_min, lim_max])
         ttl = f"Parity — {names[c]}" + (f" ({suffix})" if suffix else "")
-        plt.title(ttl); plt.xlabel(f"{names[c]} GT"); plt.ylabel(f"{names[c]} Pred"); tag=f"_{suffix}" if suffix else ""
-        plt.tight_layout(); plt.savefig(os.path.join(save_dir,"parity",f"parity_{names[c]}{tag}.png"), dpi=200); plt.close()
+        plt.title(ttl)
+        plt.xlabel(f"{names[c]} GT")
+        plt.ylabel(f"{names[c]} Pred")
+        tag = f"_{suffix}" if suffix else ""
+        plt.tight_layout()
+        plt.savefig(os.path.join(save_dir, "parity", f"parity_{names[c]}{tag}.png"), dpi=200)
+        plt.close()
+
 
 def channelwise_metrics(y_true, y_pred, mask, eps=1e-9):
-    out={}; names=FAMILIES; B, C, T = y_true.shape
+    out = {}
+    names = FAMILIES
+    B, C, T = y_true.shape
     for c in range(C):
-        valid = mask[:, c, :].reshape(-1).astype(bool) if mask is not None else np.ones(B*T, bool)
-        gt = y_true[:, c, :].reshape(-1)[valid]; pd = y_pred[:, c, :].reshape(-1)[valid]
-        if gt.size==0: out[f"MAE_{names[c]}"]=out[f"RMSE_{names[c]}"]=out[f"R2_{names[c]}"]=np.nan; continue
-        diff = pd-gt; ss_res=float(np.sum(diff**2)); ss_tot=float(np.sum((gt-np.mean(gt))**2))
-        out[f"MAE_{names[c]}"]=float(np.mean(np.abs(diff)))
-        out[f"RMSE_{names[c]}"]=float(np.sqrt(np.mean(diff**2)+eps))
-        out[f"R2_{names[c]}"]=float(1-ss_res/(ss_tot+eps))
+        valid = mask[:, c, :].reshape(-1).astype(bool) if mask is not None else np.ones(B * T, bool)
+        gt = y_true[:, c, :].reshape(-1)[valid]
+        pd = y_pred[:, c, :].reshape(-1)[valid]
+        if gt.size == 0:
+            out[f"MAE_{names[c]}"] = out[f"RMSE_{names[c]}"] = out[f"R2_{names[c]}"] = np.nan
+            continue
+        diff = pd - gt
+        ss_res = float(np.sum(diff ** 2))
+        ss_tot = float(np.sum((gt - np.mean(gt)) ** 2))
+        out[f"MAE_{names[c]}"] = float(np.mean(np.abs(diff)))
+        out[f"RMSE_{names[c]}"] = float(np.sqrt(np.mean(diff ** 2) + eps))
+        out[f"R2_{names[c]}"] = float(1 - ss_res / (ss_tot + eps))
     return out
 
-def ion_out(x, scale=1.0, beta=2.0):
-    z0 = F.softplus(torch.zeros(1, device=x.device, dtype=x.dtype), beta=beta)
-    return (F.softplus(x, beta=beta) - z0) * scale
 
-# -------------------- 加权后仿射（新增函数） --------------------
-def affine_calibrate_per_channel_weighted(y_true, y_pred, mask,
-                                          gamma=4.0, cap=50.0, base_q=0.75):
-    """
-    对每个通道做加权线性校准： t ≈ a * p + b
-    Ion_Flux 通道使用高值权重（同 ion_weight 逻辑），F_Flux 等权。
-    """
-    yt = y_true.detach().cpu().numpy()
-    yp = y_pred.detach().cpu().numpy()
-    m  = mask.detach().cpu().numpy().astype(bool)
-    a = np.ones(2, dtype=np.float32); b = np.zeros(2, dtype=np.float32)
-
-    for c in range(2):
-        idx = m[:, c, :].reshape(-1)
-        t = yt[:, c, :].reshape(-1)[idx]
-        p = yp[:, c, :].reshape(-1)[idx]
-        if t.size < 10:
-            continue
-
-        if c == 1:
-            # Ion_Flux：构造权重（与训练同风格）
-            pos = np.clip(t, 0, None)
-            if (pos > 0).any():
-                pq = np.quantile(pos[pos > 0], base_q)
-            else:
-                pq = 1.0
-            w = np.minimum((pos / (pq + 1e-9)) ** gamma, cap).astype(np.float64)
-            w = np.clip(w, 1e-6, None)
-        else:
-            # F_Flux：等权
-            w = np.ones_like(t, dtype=np.float64)
-
-        # 加权最小二乘：对 X、y 同时乘 sqrt(w)
-        X = np.vstack([p, np.ones_like(p)]).T.astype(np.float64)
-        sw = np.sqrt(w)[:, None]
-        coef, *_ = np.linalg.lstsq(X * sw, (t[:, None] * sw), rcond=None)
-        a[c], b[c] = float(coef[0, 0]), float(coef[1, 0])
-
-    return a, b
-
+# -------------------- 单调校准（Ion 后处理） --------------------
 def _enforce_monotone(y: np.ndarray) -> np.ndarray:
     """把 y 改成非降序（单调不减）。"""
     y_mono = y.copy()
     for i in range(1, len(y_mono)):
-        if y_mono[i] < y_mono[i-1]:
-            y_mono[i] = y_mono[i-1]
+        if y_mono[i] < y_mono[i - 1]:
+            y_mono[i] = y_mono[i - 1]
     return y_mono
+
 
 def monotone_calibrate_ion(y_true: torch.Tensor,
                            y_pred: torch.Tensor,
@@ -191,18 +203,10 @@ def monotone_calibrate_ion(y_true: torch.Tensor,
                            n_bins: int = 20,
                            q_lo: float = 0.01,
                            q_hi: float = 0.99) -> tuple[torch.Tensor, dict]:
-    """
-    对 Ion 预测做单调分段线性标定：
-      1) 以 y_pred 的分位点作为“横轴结点”，每个 bin 内取 y_true 的均值作为“纵轴结点”
-      2) 对纵轴结点做“累积最大” -> 保证单调不降
-      3) 对所有样本在结点间线性插值得到校准后的预测
-    仅对 Ion 通道 (C=2 的第 2 个通道) 生效。
-    返回：calibrated_pred, debug_info
-    """
     # 拉到 CPU / numpy
     yp = y_pred.detach().cpu().numpy()   # (B,2,T)
     yt = y_true.detach().cpu().numpy()
-    m  = mask.detach().cpu().numpy().astype(bool)
+    m = mask.detach().cpu().numpy().astype(bool)
 
     B, C, T = yp.shape
     assert C == 2, "expect 2 channels [F_Flux, Ion_Flux]"
@@ -210,8 +214,8 @@ def monotone_calibrate_ion(y_true: torch.Tensor,
 
     # 只取有效样本
     idx = m[:, ch, :].reshape(-1)
-    p  = yp[:, ch, :].reshape(-1)[idx]
-    t  = yt[:, ch, :].reshape(-1)[idx]
+    p = yp[:, ch, :].reshape(-1)[idx]
+    t = yt[:, ch, :].reshape(-1)[idx]
     if p.size < max(64, n_bins):
         # 数据太少，直接返回原预测
         return y_pred, {"used": False, "reason": "too_few_points"}
@@ -219,7 +223,8 @@ def monotone_calibrate_ion(y_true: torch.Tensor,
     # 去掉极端点，避免边界外插爆炸
     p_lo, p_hi = np.quantile(p, [q_lo, q_hi])
     sel = (p >= p_lo) & (p <= p_hi)
-    p_use = p[sel]; t_use = t[sel]
+    p_use = p[sel]
+    t_use = t[sel]
 
     # 以预测的分位点做横轴结点
     qs = np.linspace(q_lo, q_hi, n_bins)
@@ -229,10 +234,10 @@ def monotone_calibrate_ion(y_true: torch.Tensor,
     y_knots = []
     edges = np.concatenate([[-np.inf], (x_knots[:-1] + x_knots[1:]) / 2.0, [np.inf]])
     for i in range(n_bins):
-        lo, hi = edges[i], edges[i+1]
+        lo, hi = edges[i], edges[i + 1]
         sel_bin = (p_use >= lo) & (p_use < hi)
         if sel_bin.sum() < 8:
-            # 样本太少时用邻近预测值的回归近似：这里直接用中位数回填
+            # 样本太少时用整体中位数回填
             y_knots.append(np.median(t_use))
         else:
             y_knots.append(float(np.mean(t_use[sel_bin])))
@@ -258,36 +263,18 @@ def monotone_calibrate_ion(y_true: torch.Tensor,
         "x_knots": x_knots.tolist(),
         "y_knots_raw": y_knots.tolist(),
         "y_knots_mono": y_knots_mono.tolist(),
-        "q_lo": float(q_lo), "q_hi": float(q_hi), "n_bins": int(n_bins)
+        "q_lo": float(q_lo),
+        "q_hi": float(q_hi),
+        "n_bins": int(n_bins),
     }
     return y_cal_t, dbg
 
-def apply_affine(y_pred, a, b):
-    a = torch.tensor(a, dtype=y_pred.dtype, device=y_pred.device).view(1,2,1)
-    b = torch.tensor(b, dtype=y_pred.dtype, device=y_pred.device).view(1,2,1)
-    return a * y_pred + b
 
-# -------------------- Ion 损失/权重（带日程） --------------------
-def ion_log_loss(pred_ch, tgt_ch, ion_c=1e-4, p=2.0):
-    lpred = torch.log(torch.clamp(pred_ch, min=1e-8) + ion_c)
-    ltgt  = torch.log(torch.clamp(tgt_ch,  min=1e-8) + ion_c)
-    diff = lpred - ltgt
-    return diff.abs() if p == 1.0 else diff.pow(p)
-
-def mix_l1_log_loss(pred_ch, tgt_ch, ion_c, alpha, p):
-    """ alpha∈[0,1]: 0→纯L1，1→纯log-loss """
-    l1 = torch.abs(pred_ch - tgt_ch)
-    lg = ion_log_loss(pred_ch, tgt_ch, ion_c=ion_c, p=p)
-    return (1.0 - alpha) * l1 + alpha * lg
-
-def ramp_value(epoch, start, end, v0, v1):
-    if epoch <= start: return v0
-    if epoch >= end:   return v1
-    t = (epoch - start) / max(1e-6, (end - start))
-    return v0 + (v1 - v0) * 0.5 * (1 - np.cos(np.pi * t))
-
-# -------------------- Ion 高值样本权重（替换原函数） --------------------
+# -------------------- Ion 工具函数 --------------------
 def ion_weight(tgt_ch, mask_ch, gamma=4.0, cap=50.0, base_q=0.75):
+    """
+    针对 Ion 的高值样本加权：值越大，权重越高（上限 cap）。
+    """
     if mask_ch.dim() == 3 and mask_ch.size(1) != 1:
         mask_ch = mask_ch[:, 1:2, :]
     with torch.no_grad():
@@ -299,42 +286,51 @@ def ion_weight(tgt_ch, mask_ch, gamma=4.0, cap=50.0, base_q=0.75):
         w_mag = torch.clamp((pos / (pq + 1e-9)) ** gamma, max=cap)
     return w_mag * mask_ch.float()
 
-# ========== 新增：Ion 的 log 域变换 ==========
+
 def to_log_domain(x, c):      # x>0,  c>0
     return torch.log(torch.clamp(x, min=1e-12) + c)
 
-def from_log_domain(z, c):    # 反变换
-    return torch.exp(z) - c
 
 # -------------------- 学习率调度：Warmup + Cosine --------------------
 def make_warmup_cosine(optimizer, total_epochs, warmup_epochs, base_lr, use_cosine=True):
     if not use_cosine:
         return torch.optim.lr_scheduler.ConstantLR(optimizer, factor=1.0)
+
     def lr_lambda(epoch):
         if epoch < warmup_epochs:
             return float(epoch + 1) / max(1, warmup_epochs)
         progress = (epoch - warmup_epochs) / max(1, total_epochs - warmup_epochs)
         return 0.5 * (1.0 + np.cos(np.pi * progress))
+
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
+
+def hetero_gaussian_nll(mu, logvar, y_true, mask):
+    """
+    异方差高斯 NLL：
+        mu, logvar, y_true, mask: (B,1,T)
+    """
+    inv_var = torch.exp(-logvar).clamp_max(1e6)
+    nll = 0.5 * ((mu - y_true) ** 2 * inv_var + logvar)
+    nll = (nll * mask).sum() / mask.sum().clamp_min(1e-6)
+    return nll
+
+
 # -------------------- 训练单通道 --------------------
-# ================== 替换函数 1：train_single_channel ==================
 def train_single_channel(channel_idx, dataset, meta):
-    """
-    F_Flux: 保持你现有的 L1 + TV 等配置不变。
-    Ion_Flux: 用 log 域回归，并在训练期学习全局仿射 (a,b)： y_log* ≈ a * z_pred + b
-              其中 z_pred 是模型原始输出（不做 softplus），y_log*=log(y+c)。
-              训练结束把 a,b,c 一起保存在 ckpt 里；验证/导出时再做反变换 exp(a*z+b)-c。
-    """
     is_F = (channel_idx == 0)
     ch_name = FAMILIES[channel_idx]
-    out_dir = os.path.join(Cfg.save_dir, ch_name); os.makedirs(out_dir, exist_ok=True)
+    out_dir = os.path.join(Cfg.save_dir, ch_name)
+    os.makedirs(out_dir, exist_ok=True)
     set_seed(Cfg.seed)
 
     # ===== 数据划分 =====
-    N = len(dataset); nval = max(1, int(N * Cfg.val_ratio))
-    tr_set, va_set = random_split(dataset, [N - nval, nval],
-                                  generator=torch.Generator().manual_seed(Cfg.seed))
+    N = len(dataset)
+    nval = max(1, int(N * Cfg.val_ratio))
+    tr_set, va_set = random_split(
+        dataset, [N - nval, nval],
+        generator=torch.Generator().manual_seed(Cfg.seed)
+    )
     tr = DataLoader(tr_set, batch_size=Cfg.batch, shuffle=True)
     va = DataLoader(va_set, batch_size=Cfg.batch, shuffle=False)
     T = int(meta["T"])
@@ -342,28 +338,39 @@ def train_single_channel(channel_idx, dataset, meta):
     # ===== 模型（Ion 可用独立的更大容量；未在 Cfg 里定义则回退到通用值）=====
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if is_F:
-        model = PhysicsSeqPredictor(d_model=Cfg.d_model, nhead=Cfg.nhead, num_layers=Cfg.num_layers,
-                                    dim_ff=Cfg.dim_ff, dropout=Cfg.dropout, T=T).to(dev)
+        model = PhysicsSeqPredictor(
+            d_model=Cfg.d_model, nhead=Cfg.nhead, num_layers=Cfg.num_layers,
+            dim_ff=Cfg.dim_ff, dropout=Cfg.dropout, T=T
+        ).to(dev)
+        ion_arch = None
     else:
-        d_model  = getattr(Cfg, "ion_d_model", 192)
-        nhead    = getattr(Cfg, "ion_nhead",   8)
+        d_model = getattr(Cfg, "ion_d_model", 192)
+        nhead = getattr(Cfg, "ion_nhead", 8)
         n_layers = getattr(Cfg, "ion_num_layers", 6)
-        dim_ff   = getattr(Cfg, "ion_dim_ff",  384)
-        dropout  = getattr(Cfg, "ion_dropout", 0.1)
-        model = PhysicsSeqPredictor(d_model=d_model, nhead=nhead, num_layers=n_layers,
-                                    dim_ff=dim_ff, dropout=dropout, T=T).to(dev)
+        dim_ff = getattr(Cfg, "ion_dim_ff", 384)
+        dropout = getattr(Cfg, "ion_dropout", 0.1)
+        model = PhysicsSeqPredictor(
+            d_model=d_model, nhead=nhead, num_layers=n_layers,
+            dim_ff=dim_ff, dropout=dropout, T=T
+        ).to(dev)
+        ion_arch = {
+            "d_model": d_model,
+            "nhead": nhead,
+            "num_layers": n_layers,
+            "dim_ff": dim_ff,
+            "dropout": dropout,
+        }
 
     # ===== 损失/TV/F 配置 =====
     if is_F:
         base_loss = _make_loss(Cfg.f_loss)
-        eps_mask  = Cfg.eps_mask_F
+        eps_mask = Cfg.eps_mask_F
         use_tv_reg = Cfg.use_tv_reg_F
-        tv_lambda  = Cfg.tv_lambda_F
+        tv_lambda = Cfg.tv_lambda_F
     else:
-        # Ion 的 log 域训练不再用 softplus，也不做样本加权/分箱正则；用 Huber 更稳
-        eps_mask  = Cfg.eps_mask_I
+        eps_mask = Cfg.eps_mask_I  # 这里只参与 mask_ch 的构造
         use_tv_reg = False
-        tv_lambda  = 0.0
+        tv_lambda = 0.0
 
     # ======= Ion: 估计 log 平移常数 c =======
     ion_c = Cfg.ion_c_min
@@ -373,8 +380,10 @@ def train_single_channel(channel_idx, dataset, meta):
             for _, phys_tgt, pmask, _ in tr:
                 x = phys_tgt[:, 1:2, :]
                 m = (pmask[:, 1:2, :] & (x > 0))
-                if m.any(): vals.append(x[m].float())
-                if len(vals) > 8: break
+                if m.any():
+                    vals.append(x[m].float())
+                if len(vals) > 8:
+                    break
             if len(vals):
                 allv = torch.cat(vals)
                 ion_c = float(torch.quantile(allv, Cfg.ion_c_quantile).item())
@@ -382,33 +391,36 @@ def train_single_channel(channel_idx, dataset, meta):
 
     # ======= 优化器/调度 =======
     params = list(model.parameters())
-    if not is_F:
-        # Ion 同时学习全局仿射参数 a,b
-        a_aff = nn.Parameter(torch.tensor(1.0, device=dev, dtype=torch.float32))
-        b_aff = nn.Parameter(torch.tensor(0.0, device=dev, dtype=torch.float32))
-        params += [a_aff, b_aff]
     opt_lr = Cfg.lr if is_F else getattr(Cfg, "ion_lr", 5e-4)
-    wd     = Cfg.weight_decay if is_F else getattr(Cfg, "ion_weight_decay", 1e-4)
+    wd = Cfg.weight_decay if is_F else getattr(Cfg, "ion_weight_decay", 1e-4)
     opt = torch.optim.AdamW(params, lr=opt_lr, weight_decay=wd)
     sch = make_warmup_cosine(opt, Cfg.max_epochs, Cfg.warmup_epochs, opt_lr, use_cosine=Cfg.use_cosine)
 
     tr_hist, va_hist = [], []
-    best = 1e9; best_path = os.path.join(out_dir, "phys_best.pth")
+    best = 1e9
+    best_path = os.path.join(out_dir, "phys_best.pth")
     saved_batch = False
 
     # =================== 训练循环 ===================
     for e in range(1, Cfg.max_epochs + 1):
-        model.train(); s = 0.0; n = 0
+        model.train()
+        s = 0.0
+        n = 0
 
         for s8, phys_tgt, pmask, tvals in tr:
-            s8 = s8.to(dev); phys_tgt = phys_tgt.to(dev); pmask = pmask.to(dev); tvals = tvals.to(dev)
+            s8 = s8.to(dev)
+            phys_tgt = phys_tgt.to(dev)
+            pmask = pmask.to(dev)
+            tvals = tvals.to(dev)
 
             if not saved_batch:
-                np.savez_compressed(os.path.join(out_dir, "one_batch_debug.npz"),
-                                    s8=s8.cpu().numpy(),
-                                    tgt=phys_tgt.cpu().numpy(),
-                                    mask=pmask.cpu().numpy(),
-                                    t=tvals.cpu().numpy())
+                np.savez_compressed(
+                    os.path.join(out_dir, "one_batch_debug.npz"),
+                    s8=s8.cpu().numpy(),
+                    tgt=phys_tgt.cpu().numpy(),
+                    mask=pmask.cpu().numpy(),
+                    t=tvals.cpu().numpy()
+                )
                 saved_batch = True
 
             pred = model(s8, tvals)  # (B,2,T)
@@ -436,15 +448,40 @@ def train_single_channel(channel_idx, dataset, meta):
                 else:
                     loss = loss_main
             else:
-                # ========= Ion_Flux：log 域 + 学习 (a,b) =========
-                pos_mask = (mask_ch & (tgt_ch > 0))
-                if pos_mask.sum() == 0:
-                    continue
-                y_log = torch.log(torch.clamp(tgt_ch, min=1e-12) + ion_c)  # 目标
-                z_pred = pred_ch_raw                                         # 模型输出
-                z_adj  = a_aff * z_pred + b_aff                              # 学到的仿射
+                # ========= Ion：log 域 μ / logvar + 异方差 NLL =========
+                y_pred = pred  # (B,2,T)
+                z_mu = y_pred[:, 1:2, :]     # (B,1,T) 约定为 log 域均值
+                logvar = y_pred[:, 0:1, :]   # (B,1,T) 约定为 logvar
 
-                loss = F.smooth_l1_loss(z_adj[pos_mask], y_log[pos_mask], reduction="mean")
+                # 提取 Ion 通道真值
+                y_true_ch = phys_tgt[:, 1:2, :]
+                m_ch = pmask[:, 1:2, :].float()
+
+                # 物理裁剪
+                y_true_ch = torch.clamp(
+                    y_true_ch,
+                    min=getattr(Cfg, "ion_y_min", 0.0),
+                    max=getattr(Cfg, "ion_y_max", 50.0)
+                )
+
+                # log 域目标
+                y_log = to_log_domain(y_true_ch, ion_c)
+
+                # 样本权重（大 Ion 加权）
+                w_mag = ion_weight(y_true_ch, m_ch)
+                eff_mask = m_ch * w_mag
+
+                # 异方差 NLL
+                nll = hetero_gaussian_nll(z_mu, logvar, y_log, eff_mask)
+
+                # 再加一个 Huber 正则（只对 mu）
+                huber = F.smooth_l1_loss(
+                    z_mu[eff_mask.bool()],
+                    y_log[eff_mask.bool()],
+                    reduction="mean"
+                )
+                huber_lambda = getattr(Cfg, "ion_huber_lambda", 0.1)
+                loss = nll + huber_lambda * huber
 
             opt.zero_grad()
             loss.backward()
@@ -452,16 +489,23 @@ def train_single_channel(channel_idx, dataset, meta):
                 nn.utils.clip_grad_norm_(model.parameters(), Cfg.clip_grad_norm)
             opt.step()
 
-            s += loss.item() * s8.size(0); n += s8.size(0)
+            s += loss.item() * s8.size(0)
+            n += s8.size(0)
 
-        trl = s / max(1, n); tr_hist.append(trl)
+        trl = s / max(1, n)
+        tr_hist.append(trl)
         sch.step()
 
         # =================== 验证 ===================
-        model.eval(); s = 0.0; n = 0
+        model.eval()
+        s = 0.0
+        n = 0
         with torch.no_grad():
             for s8, phys_tgt, pmask, tvals in va:
-                s8 = s8.to(dev); phys_tgt = phys_tgt.to(dev); pmask = pmask.to(dev); tvals = tvals.to(dev)
+                s8 = s8.to(dev)
+                phys_tgt = phys_tgt.to(dev)
+                pmask = pmask.to(dev)
+                tvals = tvals.to(dev)
                 pred = model(s8, tvals)
                 pred_ch_raw = pred[:, channel_idx:channel_idx + 1, :]
                 tgt_ch = phys_tgt[:, channel_idx:channel_idx + 1, :]
@@ -477,41 +521,72 @@ def train_single_channel(channel_idx, dataset, meta):
                     loss_main = (loss_e * w).sum() / (w.sum().clamp_min(1e-6))
                     val_loss = loss_main
                 else:
-                    pos_mask = (mask_ch & (tgt_ch > 0))
-                    if pos_mask.sum() == 0:
-                        continue
-                    y_log = torch.log(torch.clamp(tgt_ch, min=1e-12) + ion_c)
-                    z_pred = pred_ch_raw
-                    z_adj  = a_aff * z_pred + b_aff
-                    val_loss = F.smooth_l1_loss(z_adj[pos_mask], y_log[pos_mask], reduction="mean")
+                    # ========= Ion 验证：用和训练同一套 z_mu/logvar 逻辑 =========
+                    y_pred = pred  # (B,2,T)
+                    z_mu = y_pred[:, 1:2, :]   # log 域均值
+                    logvar = y_pred[:, 0:1, :]  # logvar
 
-                s += float(val_loss) * s8.size(0); n += s8.size(0)
+                    y_true_ch = phys_tgt[:, 1:2, :]
+                    m_ch = pmask[:, 1:2, :].float()
 
-        val = s / max(1, n); va_hist.append(val)
+                    y_true_ch = torch.clamp(
+                        y_true_ch,
+                        min=getattr(Cfg, "ion_y_min", 0.0),
+                        max=getattr(Cfg, "ion_y_max", 50.0)
+                    )
+                    y_log = to_log_domain(y_true_ch, ion_c)
+
+                    # 验证时使用未加权 mask
+                    eff_mask = m_ch
+
+                    nll = hetero_gaussian_nll(z_mu, logvar, y_log, eff_mask)
+                    huber = F.smooth_l1_loss(
+                        z_mu[eff_mask.bool()],
+                        y_log[eff_mask.bool()],
+                        reduction="mean"
+                    )
+                    huber_lambda = getattr(Cfg, "ion_huber_lambda", 0.1)
+                    val_loss = nll + huber_lambda * huber
+
+                s += float(val_loss) * s8.size(0)
+                n += s8.size(0)
+
+        val = s / max(1, n)
+        va_hist.append(val)
+
         if is_F:
             print(f"[A-{ch_name}][{e}/{Cfg.max_epochs}] train {trl:.4f} | val {val:.4f}")
         else:
-            # 诊断：log 域 μ/σ；用 z_adj 对齐后再看
+            # 诊断：log 域 μ/σ
             with torch.no_grad():
                 try:
                     s8_dbg, phys_tgt_dbg, pmask_dbg, tvals_dbg = next(iter(va))
-                    s8_dbg = s8_dbg.to(dev); phys_tgt_dbg = phys_tgt_dbg.to(dev)
-                    pmask_dbg = pmask_dbg.to(dev); tvals_dbg = tvals_dbg.to(dev)
-                    z = model(s8_dbg, tvals_dbg)[:, 1:2, :]
+                    s8_dbg = s8_dbg.to(dev)
+                    phys_tgt_dbg = phys_tgt_dbg.to(dev)
+                    pmask_dbg = pmask_dbg.to(dev)
+                    tvals_dbg = tvals_dbg.to(dev)
+                    y_pred_dbg = model(s8_dbg, tvals_dbg)
+                    z = y_pred_dbg[:, 1:2, :]
                     tgt = phys_tgt_dbg[:, 1:2, :]
                     m = (pmask_dbg[:, 1:2, :] & (tgt > 0))
-                    z_adj = a_aff * z + b_aff
-                    y_log_dbg = torch.log(torch.clamp(tgt, min=1e-12) + ion_c)
-                    zp = z_adj[m]; yt = y_log_dbg[m]
-                    p_mean = float(zp.mean()); p_std = float(zp.std(unbiased=False))
-                    t_mean = float(yt.mean()); t_std = float(yt.std(unbiased=False))
-                    ratio = p_std / (t_std + 1e-12)
-                    print(f"[A-{ch_name}][{e}/{Cfg.max_epochs}] train {trl:.4f} | val {val:.4f}")
-                    print(f"[DBG-{ch_name}][{e}] log pred μ/σ={p_mean:.4f}/{p_std:.4f}  "
-                          f"log tgt μ/σ={t_mean:.4f}/{t_std:.4f}  ratio={ratio:.3f}  ion_c={ion_c:.2e}  "
-                          f"a={float(a_aff):.3f} b={float(b_aff):.3f}")
+                    y_log_dbg = to_log_domain(tgt, ion_c)
+                    zp = z[m]
+                    yt = y_log_dbg[m]
+                    if zp.numel() > 0:
+                        p_mean = float(zp.mean())
+                        p_std = float(zp.std(unbiased=False))
+                        t_mean = float(yt.mean())
+                        t_std = float(yt.std(unbiased=False))
+                        ratio = p_std / (t_std + 1e-12)
+                        print(f"[A-{ch_name}][{e}/{Cfg.max_epochs}] train {trl:.4f} | val {val:.4f}")
+                        print(
+                            f"[DBG-{ch_name}][{e}] log pred μ/σ={p_mean:.4f}/{p_std:.4f}  "
+                            f"log tgt μ/σ={t_mean:.4f}/{t_std:.4f}  ratio={ratio:.3f}  ion_c={ion_c:.2e}"
+                        )
+                    else:
+                        print(f"[A-{ch_name}][{e}/{Cfg.max_epochs}] train {trl:.4f} | val {val:.4f} (no valid Ion points)")
                 except StopIteration:
-                    pass
+                    print(f"[A-{ch_name}][{e}/{Cfg.max_epochs}] train {trl:.4f} | val {val:.4f}")
 
         # ====== 保存最优 ======
         if val < best:
@@ -519,72 +594,42 @@ def train_single_channel(channel_idx, dataset, meta):
             ckpt = {
                 "model": model.state_dict(),
                 "meta": _clean_meta(meta),
-                "hist": {"train": tr_hist, "val": va_hist}
+                "hist": {"train": tr_hist, "val": va_hist},
             }
             if not is_F:
-                ckpt["ion_affine"] = {"a": float(a_aff.detach().cpu()),
-                                      "b": float(b_aff.detach().cpu()),
-                                      "c": float(ion_c)}
+                ckpt["ion_affine"] = {"c": float(ion_c)}
+                if ion_arch is not None:
+                    ckpt["ion_arch"] = ion_arch
             torch.save(ckpt, best_path)
             print("  -> saved", best_path)
 
     # 学习曲线
     with open(os.path.join(out_dir, "learning_curve.csv"), "w", newline="") as f:
-        wcsv = csv.writer(f); wcsv.writerow(["epoch", "train", "val"])
+        wcsv = csv.writer(f)
+        wcsv.writerow(["epoch", "train", "val"])
         for i, (trv, vv) in enumerate(zip(tr_hist, va_hist), start=1):
             wcsv.writerow([i, trv, vv])
 
     return best_path
 
 
-# ================== 替换函数 2：ion_inverse_for_export ==================
+# ================== Ion: log→linear 反变换 ==================
 def ion_inverse_for_export(z_logits: torch.Tensor, ckpt: dict) -> torch.Tensor:
     """
-    把 Ion 的模型输出 z (B,1,T) 还原到物理量域：
-        y_hat = exp(a*z + b) - c
-    a,b,c 来自训练 ckpt["ion_affine"]；若缺失则回退 a=1,b=0,c=Cfg.ion_c_min
+    把 Ion 的模型输出 z_mu (B,1,T) 还原到物理量域：
+        y_hat = exp(z_mu) - c
+    c 来自训练 ckpt["ion_affine"]["c"]；若缺失则回退到 Cfg.ion_c_min。
     """
     aff = ckpt.get("ion_affine", None)
     if aff is None:
-        a = 1.0; b = 0.0; c = getattr(Cfg, "ion_c_min", 1e-6)
+        c = getattr(Cfg, "ion_c_min", 1e-6)
     else:
-        a = float(aff.get("a", 1.0))
-        b = float(aff.get("b", 0.0))
         c = float(aff.get("c", getattr(Cfg, "ion_c_min", 1e-6)))
 
-    a_t = torch.tensor(a, dtype=z_logits.dtype, device=z_logits.device).view(1, 1, 1)
-    b_t = torch.tensor(b, dtype=z_logits.dtype, device=z_logits.device).view(1, 1, 1)
-    y = torch.exp(a_t * z_logits + b_t) - c
+    c_t = torch.tensor(c, dtype=z_logits.dtype, device=z_logits.device).view(1, 1, 1)
+    y = torch.exp(z_logits) - c_t
     return torch.clamp(y, min=0.0)
 
-
-def residual_bias_penalty(gt, pred, mask, n_bins=8, lam=0.02):
-    """
-    gt, pred, mask: (B,1,T) 张量，已在同一域（训练所用的域）
-    作用：按 gt 分箱，惩罚各箱残差的均值（让每个数值区间的系统性偏差接近 0）
-    """
-    if lam <= 0:
-        return gt.new_tensor(0.0)
-
-    with torch.no_grad():
-        g = gt[mask.bool()]
-        if g.numel() < 64:
-            return gt.new_tensor(0.0)
-        qs = torch.quantile(g, torch.linspace(0, 1, n_bins + 1, device=g.device))
-    res = (pred - gt)
-    loss = gt.new_tensor(0.0)
-    total_bins = 0
-    for i in range(n_bins):
-        lo, hi = qs[i], qs[i+1]
-        sel = mask & (gt >= lo) & (gt <= hi)
-        if sel.sum() < 16:
-            continue
-        mean_res = (res[sel].mean())
-        loss = loss + mean_res.abs()
-        total_bins += 1
-    if total_bins == 0:
-        return gt.new_tensor(0.0)
-    return lam * (loss / total_bins)
 
 # -------------------- 主流程 --------------------
 def main():
@@ -625,24 +670,26 @@ def main():
 
     model_f.load_state_dict(ckpt_f["model"])
     model_i.load_state_dict(ckpt_i["model"])
-    model_f.eval();
+    model_f.eval()
     model_i.eval()
 
-    # ===== 验证集推理（Ion: log→linear 反变换 + 导出后仿射校准） =====
-    N = len(dataset);
+    # ===== 验证集推理（Ion: log→linear 反变换 + 单调校准） =====
+    N = len(dataset)
     nval = max(1, int(N * Cfg.val_ratio))
-    _, va_set = random_split(dataset, [N - nval, nval],
-                             generator=torch.Generator().manual_seed(Cfg.seed))
+    _, va_set = random_split(
+        dataset, [N - nval, nval],
+        generator=torch.Generator().manual_seed(Cfg.seed)
+    )
     va = DataLoader(va_set, batch_size=Cfg.batch, shuffle=False)
 
     preds_f, preds_i, trues, masks = [], [], [], []
     with torch.no_grad():
         for s8, phys_tgt, pmask, tvals in va:
-            s8 = s8.to(dev);
+            s8 = s8.to(dev)
             tvals = tvals.to(dev)
             pf = model_f(s8, tvals)[:, 0:1, :]
 
-            # Ion: 先拿到 z，再做 exp(a*z+b)-c 的反变换
+            # Ion: 先拿到 z_mu，再做 exp(z_mu)-c 的反变换
             zi = model_i(s8, tvals)[:, 1:2, :]
             pi = ion_inverse_for_export(zi, ckpt_i)
 
@@ -652,7 +699,7 @@ def main():
             masks.append(pmask)
 
     yhat = torch.cat([torch.cat(preds_f, 0), torch.cat(preds_i, 0)], dim=1)
-    ytrue = torch.cat(trues, 0);
+    ytrue = torch.cat(trues, 0)
     mask = torch.cat(masks, 0)
 
     # ===== 显示域变换 =====
@@ -720,44 +767,72 @@ def main():
     # ===== 达标检查 & 诊断（原样保留） =====
     r2_f = chm_eps.get("R2_F_Flux", None)
     r2_i = chm_eps.get("R2_Ion_Flux", None)
-    need_diag = (r2_f is not None and r2_f < Cfg.target_R2_F) or (r2_i is not None and r2_i < Cfg.target_R2_I)
-    diag_dir = os.path.join(Cfg.save_dir, "diagnostics");
+    need_diag = ((r2_f is not None and r2_f < Cfg.target_R2_F) or
+                 (r2_i is not None and r2_i < Cfg.target_R2_I))
+    diag_dir = os.path.join(Cfg.save_dir, "diagnostics")
     os.makedirs(diag_dir, exist_ok=True)
     if need_diag:
         for c, name in enumerate(FAMILIES):
-            valid = mask_np_eps[:,c,:].reshape(-1).astype(bool)
-            gt = ytrue_np[:,c,:].reshape(-1)[valid]; pd = yhat_np[:,c,:].reshape(-1)[valid]
+            valid = mask_np_eps[:, c, :].reshape(-1).astype(bool)
+            gt = ytrue_np[:, c, :].reshape(-1)[valid]
+            pd = yhat_np[:, c, :].reshape(-1)[valid]
             res = pd - gt
-            plt.figure(figsize=(5,4)); plt.scatter(gt, res, s=3, alpha=0.5); plt.axhline(0, lw=1)
-            plt.xlabel(f"{name} GT"); plt.ylabel("Residual (Pred-GT)"); plt.title(f"Residual vs GT — {name}")
-            plt.tight_layout(); plt.savefig(os.path.join(diag_dir, f"residual_vs_gt_{name}.png"), dpi=200); plt.close()
-            plt.figure(figsize=(5,4)); plt.hist(res, bins=60, alpha=0.8)
-            plt.xlabel("Residual"); plt.ylabel("Count"); plt.title(f"Residual Histogram — {name}")
-            plt.tight_layout(); plt.savefig(os.path.join(diag_dir, f"residual_hist_{name}.png"), dpi=200); plt.close()
+            plt.figure(figsize=(5, 4))
+            plt.scatter(gt, res, s=3, alpha=0.5)
+            plt.axhline(0, lw=1)
+            plt.xlabel(f"{name} GT")
+            plt.ylabel("Residual (Pred-GT)")
+            plt.title(f"Residual vs GT — {name}")
+            plt.tight_layout()
+            plt.savefig(os.path.join(diag_dir, f"residual_vs_gt_{name}.png"), dpi=200)
+            plt.close()
+
+            plt.figure(figsize=(5, 4))
+            plt.hist(res, bins=60, alpha=0.8)
+            plt.xlabel("Residual")
+            plt.ylabel("Count")
+            plt.title(f"Residual Histogram — {name}")
+            plt.tight_layout()
+            plt.savefig(os.path.join(diag_dir, f"residual_hist_{name}.png"), dpi=200)
+            plt.close()
 
         Tn = ytrue_np.shape[2]
-        for c,name in enumerate(FAMILIES):
-            se = ( (yhat_np[:,c,:]-ytrue_np[:,c,:])**2 ) * mask_np_eps[:,c,:]
-            rmse_t = np.sqrt( np.sum(se, axis=0) / (np.sum(mask_np_eps[:,c,:], axis=0)+1e-9) )
-            plt.figure(figsize=(7,3)); plt.plot(rmse_t)
-            plt.xlabel("Time index"); plt.ylabel("RMSE"); plt.title(f"RMSE over Time — {name}")
-            plt.tight_layout(); plt.savefig(os.path.join(diag_dir, f"rmse_over_time_{name}.png"), dpi=200); plt.close()
+        for c, name in enumerate(FAMILIES):
+            valid = mask_np_eps[:, c, :].astype(bool)
+            se = ((yhat_np[:, c, :] - ytrue_np[:, c, :]) ** 2) * valid
+            rmse_t = np.sqrt(np.sum(se, axis=0) / (np.sum(valid, axis=0) + 1e-9))
+            plt.figure(figsize=(7, 3))
+            plt.plot(rmse_t)
+            plt.xlabel("Time index")
+            plt.ylabel("RMSE")
+            plt.title(f"RMSE over Time — {name}")
+            plt.tight_layout()
+            plt.savefig(os.path.join(diag_dir, f"rmse_over_time_{name}.png"), dpi=200)
+            plt.close()
 
-        for c,name in enumerate(FAMILIES):
-            valid = mask_np_eps[:,c,:].astype(bool)
-            se = ((yhat_np[:,c,:]-ytrue_np[:,c,:])**2) * valid
-            mse_sample = np.sum(se, axis=1) / (np.sum(valid, axis=1)+1e-9)
+        for c, name in enumerate(FAMILIES):
+            valid = mask_np_eps[:, c, :].astype(bool)
+            se = ((yhat_np[:, c, :] - ytrue_np[:, c, :]) ** 2) * valid
+            mse_sample = np.sum(se, axis=1) / (np.sum(valid, axis=1) + 1e-9)
             idx = int(np.argmax(mse_sample))
             t = np.arange(Tn)[valid[idx]]
-            plt.figure(figsize=(8,3))
-            plt.plot(t, ytrue_np[idx,c,valid[idx]], label="GT")
-            plt.plot(t, yhat_np[idx,c,valid[idx]], "--", label="Pred")
-            plt.legend(); plt.xlabel("Time"); plt.ylabel(name); plt.title(f"Worst Sample — {name}  #{idx}")
-            plt.tight_layout(); plt.savefig(os.path.join(diag_dir, f"worst_sample_timeseries_{name}.png"), dpi=200); plt.close()
+            plt.figure(figsize=(8, 3))
+            plt.plot(t, ytrue_np[idx, c, valid[idx]], label="GT")
+            plt.plot(t, yhat_np[idx, c, valid[idx]], "--", label="Pred")
+            plt.legend()
+            plt.xlabel("Time")
+            plt.ylabel(name)
+            plt.title(f"Worst Sample — {name}  #{idx}")
+            plt.tight_layout()
+            plt.savefig(os.path.join(diag_dir, f"worst_sample_timeseries_{name}.png"), dpi=200)
+            plt.close()
 
-        np.savez_compressed(os.path.join(diag_dir, "tensors_display_space.npz"),
-                            yhat=yhat_np, ytrue=ytrue_np, mask_all=mask_np_all, mask_eps=mask_np_eps,
-                            time=np.asarray(meta["time_values"]))
+        np.savez_compressed(
+            os.path.join(diag_dir, "tensors_display_space.npz"),
+            yhat=yhat_np, ytrue=ytrue_np,
+            mask_all=mask_np_all, mask_eps=mask_np_eps,
+            time=np.asarray(meta["time_values"])
+        )
         checklist = {
             "what_to_share": [
                 "diagnostics/tensors_display_space.npz",
@@ -775,9 +850,9 @@ def main():
                 "physics_metrics_all.xlsx",
                 "physics_metrics_eps.xlsx",
                 "all/summary.txt",
-                "eps/summary.txt"
+                "eps/summary.txt",
             ],
-            "note": "如未达标请把这些文件打包给我。"
+            "note": "如未达标请把这些文件打包给我。",
         }
         with open(os.path.join(diag_dir, "please_share_these.json"), "w", encoding="utf-8") as f:
             json.dump(checklist, f, indent=2, ensure_ascii=False)

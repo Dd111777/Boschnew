@@ -66,8 +66,8 @@ class ExpConfig:
         "LF_RF": {"min": 25, "max": 150, "step": 5, "unit": "W"},
         "SF6": {"min": 50, "max": 500, "step": 50, "unit": "sccm"},
         "C4F8": {"min": 50, "max": 500, "step": 50, "unit": "sccm"},
-        "DEP_time": {"min": 0.4, "max": 4.0, "step": 0.4, "unit": "s"},
-        "etch_time": {"min": 0.4, "max": 4.0, "step": 0.4, "unit": "s"},
+        "DEP_time": {"min": 0.4, "max": 2.6, "step": 0.4, "unit": "s"},
+        "etch_time": {"min": 0.4, "max": 2.6, "step": 0.4, "unit": "s"},
     }
     # 静态参数名列表（和列顺序一致）
     static_names: List[str] = list(static_params.keys())
@@ -85,12 +85,14 @@ class ExpConfig:
 
     # ========= 5. 其他基本参数 =========
     # 候选池大小 / 每轮推荐 top-K 数量
-    n_candidates: int = 2000
+    n_candidates: int = 20000
     n_select: int = 30
     n_rounds: int = 1  # 当前场景：一次性推荐即可
 
     # 随机种子（后续 Block 可扩展成 seeds 列表）
     seed: int = 42
+    # ========= 6. 瓶型惩罚强度 =========
+    bottle_penalty_weight: float = 2.0
 
 
 # ============================================================
@@ -249,9 +251,6 @@ class StageBOracle:
 
     # ------------------------------------------------------------------
     # 内部：加载模型和 meta
-    # ------------------------------------------------------------------
-    # 内部：加载模型和 meta
-    # ------------------------------------------------------------------
     def _load_model_and_meta(self):
         if not os.path.isfile(self.ckpt_path):
             raise FileNotFoundError(f"StageB ckpt 不存在：{self.ckpt_path}")
@@ -456,21 +455,6 @@ def estimate_active_subspace_from_stageB(
     batch_size: int = 64,
     target_time: str = "9",
 ) -> dict:
-    """
-    基于 StageB 模型的 Active Subspace 估计：
-      - 利用旧表 (static_norm, phys_seq, time_mat)，抽样 n_samples 个 recipe
-            - 用 autograd 计算 标量目标 J(x) 对静态输入（归一化空间）的梯度
-      - 聚合得到 C = 1/M Σ g_i g_i^T，并做特征分解
-      - 输出：
-          {
-            "eigenvalues":      (D,)  从大到小
-            "eigenvalues_frac": (D,)  归一化能量占比
-            "eigenvectors":     (D,D) 列向量为特征向量 v_k（对应 eigenvalues[k]）
-            "param_importance_first": (D,) 参数在第一主方向上的绝对权重
-            "param_names":      list[str]，与 cfg.static_names 一致
-            "target_time":      str
-          }
-    """
     if oracle.old_dataset is None or oracle.old_meta is None:
         raise RuntimeError(
             "StageBOracle.old_dataset 为空，"
@@ -584,6 +568,41 @@ def estimate_active_subspace_from_stageB(
           np.round(eigvals_frac[:3], 4))
 
     return result
+def compute_param_importance_and_trust_region(
+    cfg: "ExpConfig",
+    corr_info: dict,
+    as_info: dict,
+    alpha: float = 0.6,
+    base_trust_radius: float = 1.0,
+) -> dict:
+    # 1) Active Subspace 第一主方向重要度
+    imp_as = np.asarray(as_info["param_importance_first"], dtype=np.float64)  # (D,)
+    imp_as = imp_as / (imp_as.sum() + 1e-12)
+
+    # 2) Pearson：对 d1_3/5/9 的绝对值相关性取平均
+    pearson_df = corr_info.get("pearson", None)
+    if pearson_df is None:
+        imp_corr = np.ones_like(imp_as) / imp_as.size
+    else:
+        pearson_abs = np.abs(pearson_df.values)  # (D, 3)
+        imp_corr = pearson_abs.mean(axis=1)
+        imp_corr = imp_corr / (imp_corr.sum() + 1e-12)
+
+    # 3) 融合（alpha 越大越偏向 Active Subspace）
+    imp = alpha * imp_as + (1.0 - alpha) * imp_corr
+    imp = imp / (imp.sum() + 1e-12)
+
+    # 4) 定义各向异性 trust-region 半径：重要度越大，允许步长越大
+    #    把平均半径归一到 base_trust_radius
+    scale = base_trust_radius / (imp.mean() + 1e-12)
+    trust_radius_norm = scale * imp
+
+    as_info = dict(as_info)  # 拷一份，避免外部误改
+    as_info["param_importance_combined"] = imp           # (D,)
+    as_info["trust_radius_norm"] = trust_radius_norm     # (D,)
+
+    return as_info
+
 # ========================= Block C：多保真 Residual GP 代理 =========================
 class MultiFidelityResidualGP:
     def __init__(
@@ -594,6 +613,7 @@ class MultiFidelityResidualGP:
         y_real_train: np.ndarray,
         jitter: float = 1e-6,
         n_restarts_optimizer: int = 5,
+        param_importance: Optional[np.ndarray] = None,
     ):
         self.cfg = cfg
         self.oracle = oracle
@@ -604,8 +624,14 @@ class MultiFidelityResidualGP:
 
         self.X_train_raw = X
         self.y_real_train = Y_real
-        self.input_dim = X.shape[1]
-        self.output_dim = Y_real.shape[1]  # 3，对应 d1_3/5/9
+        self.input_dim = self.X_train_raw.shape[1]
+        self.output_dim = self.y_real_train.shape[1]
+        if param_importance is not None:
+            imp = np.asarray(param_importance, dtype=np.float64)
+            imp = imp / (imp.mean() + 1e-12)  # 归一到均值=1，方便直接缩放
+            self.param_importance = imp  # (D,)
+        else:
+            self.param_importance = None
         # d1 输出的物理上下界（用于后处理裁剪）
         self.y_min = np.array(
             [cfg.d_constraints[name]["min"] for name in cfg.d_names],
@@ -628,21 +654,27 @@ class MultiFidelityResidualGP:
 
         # 残差：高保真 - 低保真
         self.residual_train = self.y_real_train - self.y_sim_train         # (N,3)
+        if self.param_importance is not None:
+            imp = self.param_importance  # (D,)
+            length_scale0 = 1.0 / (imp + 1e-3)  # 避免除零，尺度可以按需调
+        else:
+            length_scale0 = np.ones(self.input_dim, dtype=np.float64)
 
-        # 为每个输出维度建一个 GP
         self.gps: list[GaussianProcessRegressor] = []
         for j in range(self.output_dim):
             kernel = (
-                C(1.0, (1e-3, 1e3))
-                * RBF(length_scale=np.ones(self.input_dim), length_scale_bounds=(1e-2, 1e3))
-                + WhiteKernel(noise_level=1e-5, noise_level_bounds=(1e-8, 1e0))
+                    C(1.0, (1e-3, 1e3))
+                    * RBF(
+                length_scale=length_scale0,
+                length_scale_bounds=(1e-2, 1e3),
+            )
+                    + WhiteKernel(noise_level=1e-5, noise_level_bounds=(1e-8, 1e0))
             )
             gp = GaussianProcessRegressor(
                 kernel=kernel,
                 alpha=jitter,
-                normalize_y=True,
                 n_restarts_optimizer=n_restarts_optimizer,
-                random_state=cfg.seed,
+                normalize_y=True,
             )
             gp.fit(X_scaled, self.residual_train[:, j])
             self.gps.append(gp)
@@ -717,14 +749,6 @@ class MultiFidelityResidualGP:
     # 对外接口：多保真均值 + 不确定度（σ）
     # ------------------------------------------------------------------
     def predict_with_uncertainty(self, X: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        输入：
-          X: (N,D) 或 (D,) numpy
-
-        输出：
-          μ_real: (N,3)  多保真均值
-          σ_real: (N,3)  来自残差 GP 的标准差（StageB 为确定性模型）
-        """
         X_raw = np.asarray(X, dtype=np.float64)
         if X_raw.ndim == 1:
             X_raw = X_raw[None, :]
@@ -812,6 +836,7 @@ def build_multi_fidelity_surrogate(
     d_new: np.ndarray,
     jitter: float = 1e-6,
     n_restarts_optimizer: int = 5,
+    param_importance: Optional[np.ndarray] = None,
 ) -> MultiFidelityResidualGP:
     print("[build_multi_fidelity_surrogate] 使用新表数据训练 Residual GP...")
     surrogate = MultiFidelityResidualGP(
@@ -821,6 +846,7 @@ def build_multi_fidelity_surrogate(
         y_real_train=d_new,
         jitter=jitter,
         n_restarts_optimizer=n_restarts_optimizer,
+        param_importance=param_importance,
     )
     print("[build_multi_fidelity_surrogate] 训练完成。")
     return surrogate
@@ -876,17 +902,6 @@ def sample_random_static(cfg: "ExpConfig", n: int) -> np.ndarray:
 
 
 def stageB_objective_from_preds(cfg: "ExpConfig", d_pred: np.ndarray) -> np.ndarray:
-    """
-    给定 StageB 对 d1_3/5/9 的预测值，计算一个加权 L2 损失：
-
-        J(x) = Σ_j w_j * (d_j - center_j)^2
-
-    输入：
-      d_pred: (N,3) numpy，对应 cfg.d_names 顺序（d1_3、d1_5、d1_9）
-
-    输出：
-      J: (N,) numpy，越小越接近目标
-    """
     d_pred = np.asarray(d_pred, dtype=np.float64)
     centers = np.array(
         [cfg.d_constraints[name]["center"] for name in cfg.d_names],
@@ -906,21 +921,6 @@ def evaluate_stageB_loss(
     X: np.ndarray,
     return_pred: bool = True,
 ) -> Tuple[np.ndarray, Optional[np.ndarray]]:
-    """
-    对一批候选 recipe：
-      - 调 StageBOracle 预测 d1_3/5/9
-      - 计算 StageB 视角下的目标损失 J_sim
-
-    输入：
-      cfg        : ExpConfig
-      oracle     : StageBOracle
-      X          : (N,D) numpy，静态参数
-      return_pred: 是否返回 d_pred
-
-    输出：
-      J_sim: (N,) numpy
-      d_pred: (N,3) numpy 或 None
-    """
     d_pred = oracle.predict_d1_3_5_9(X)  # (N,3)
     J_sim = stageB_objective_from_preds(cfg, d_pred)
     if return_pred:
@@ -950,6 +950,27 @@ def refine_candidates_with_stageB(
         subspace_dim = min(subspace_dim, eigvecs.shape[1])
         V_sub = eigvecs[:, :subspace_dim]  # (D,k)
 
+    # 统一的重要度和各向异性 trust-region 半径
+    param_importance = None
+    trust_radius_norm = None
+    if as_info is not None:
+        if "param_importance_combined" in as_info:
+            param_importance = np.asarray(
+                as_info["param_importance_combined"], dtype=np.float64
+            )
+        elif "param_importance_first" in as_info:
+            param_importance = np.asarray(
+                as_info["param_importance_first"], dtype=np.float64
+            )
+        if "trust_radius_norm" in as_info:
+            trust_radius_norm = np.asarray(
+                as_info["trust_radius_norm"], dtype=np.float64
+            )
+    if as_info is not None and subspace_dim > 0:
+        eigvecs = np.asarray(as_info["eigenvectors"], dtype=np.float64)  # (D,D)
+        subspace_dim = min(subspace_dim, eigvecs.shape[1])
+        V_sub = eigvecs[:, :subspace_dim]  # (D,k)
+
     device = oracle.device
     model = oracle.model
     mean = oracle.static_mean       # (1,D) on device
@@ -958,14 +979,19 @@ def refine_candidates_with_stageB(
     tvals_template = oracle.tvals_template  # (T,)
     idx_d1 = oracle.idx_d1
 
-    # d 目标中心 & 权重
+    # d 目标中心 & 权重（全部放在 device 上的 torch.tensor）
     centers = torch.tensor(
         [cfg.d_constraints[name]["center"] for name in cfg.d_names],
         dtype=torch.float32,
         device=device,
     )  # (3,)
-    w = torch.tensor(cfg.d_weights, dtype=torch.float32, device=device)
-    w = w / (w.sum() + 1e-12)
+
+    w_d = torch.tensor(
+        cfg.d_weights,  # 比如 [0.3, 0.4, 0.3]
+        dtype=torch.float32,
+        device=device,
+    )  # (3,)
+    w_d = w_d / (w_d.sum() + 1e-12)
 
     # 时间索引（3,5,9）
     tidx_list = [T2IDX[t] for t in ["3", "5", "9"]]
@@ -974,50 +1000,56 @@ def refine_candidates_with_stageB(
     X_refined = np.zeros_like(X_cur, dtype=np.float64)
 
     for i in range(N):
-        x_raw = X_cur[i : i + 1]  # (1,D)
-        x_raw_t = torch.from_numpy(x_raw.astype(np.float32)).to(device)  # (1,D)
-
+        x_raw_t = torch.from_numpy(X0[i].astype(np.float32)).to(device).view(1, -1)
+        # 记录归一化基点，用于 trust-region 约束
+        x_norm_base = ((x_raw_t - mean) / (std + 1e-8)).detach().cpu().numpy()[0]
         for _ in range(n_steps):
             # 归一化静态参数
             x_norm = ((x_raw_t - mean) / (std + 1e-8)).clone().detach()
             x_norm.requires_grad_(True)
-
             # 使用固定的平均 phys_template & tvals_template
             B = x_norm.size(0)  # 1
             phys = phys_template.expand(B, -1, -1)          # (1,2,T)
             tvals = tvals_template.unsqueeze(0).expand(B, -1)  # (1,T)
-
             y = model(x_norm, phys, tvals)                  # (1,K,T)
             d1 = y[:, idx_d1, tidx_list]                    # (1,3)
-
             diff2 = (d1 - centers.view(1, -1)) ** 2         # (1,3)
-            loss = (w.view(1, -1) * diff2).sum()            # scalar
-
+            loss = (w_d.view(1, -1) * diff2).sum()            # scalar
             loss.backward()
             g_norm = x_norm.grad.detach().cpu().numpy()[0]  # (D,)
 
             # 若有 Active Subspace，则把梯度投影到低维子空间
             if V_sub is not None:
-                # g_proj = V * (V^T g)
                 g_norm = V_sub @ (V_sub.T @ g_norm)
 
+            # 各向异性梯度缩放：重要参数步长更大
+            if param_importance is not None:
+                imp_scale = param_importance / (param_importance.mean() + 1e-12)  # numpy (D,)
+                g_norm = g_norm * imp_scale  # 这里都是 numpy
             # 在归一化空间做梯度下降
             x_norm_np = x_norm.detach().cpu().numpy()[0]
             x_norm_new = x_norm_np - lr * g_norm
 
+            # 各向异性 trust-region 约束：限制相对初始点的增量
+            if trust_radius_norm is not None:
+                delta = x_norm_new - x_norm_base
+                delta = np.clip(delta, -trust_radius_norm, trust_radius_norm)
+                x_norm_new = x_norm_base + delta
+
             # 映射回原始空间
             mean_np = mean.detach().cpu().numpy()[0]
             std_np = std.detach().cpu().numpy()[0]
-            x_raw_new = mean_np + x_norm_new * std_np       # (D,)
+            x_raw_new = mean_np + x_norm_new * std_np  # (D,)
 
             # 裁剪 + 量化
             x_raw_new = clip_and_quantize_static(cfg, x_raw_new)[0]
 
             # 准备下一个 step
-            x_raw_t = torch.from_numpy(x_raw_new.astype(np.float32)).to(device).view(1, -1)
+            x_raw_t = torch.from_numpy(
+                x_raw_new.astype(np.float32)
+            ).to(device).view(1, -1)
 
         X_refined[i] = x_raw_t.detach().cpu().numpy()[0]
-
     return X_refined
 
 
@@ -1188,26 +1220,6 @@ def compute_stageB_prior_weight(
     length_scale: float = 1.0,
     prior_floor: float = 0.1,
 ) -> np.ndarray:
-    """
-    计算 StageB 分布先验权重：
-
-      思路：
-        - 使用旧表的静态输入 X_all_raw 构建“经验分布”
-        - 在标准化空间（按旧表均值/方差）中计算每个候选点到
-          最近旧表样本的距离 d_min
-        - prior(x) = exp( -0.5 * (d_min / L)^2 )
-        - 再将 prior 下限截断到 prior_floor，避免乘完之后完全为 0
-
-    输入：
-      cfg           : ExpConfig
-      stageB_data   : load_stageB_dataset(cfg) 的输出
-      X_candidates  : (N,D) 候选
-      length_scale  : L，越大表示容忍离旧表分布更远的点
-      prior_floor   : 先验权重最小值（避免完全抹掉）
-
-    输出：
-      prior: (N,) numpy，∈ [prior_floor, 1]
-    """
     X_cand = np.asarray(X_candidates, dtype=np.float64)
     if X_cand.ndim == 1:
         X_cand = X_cand[None, :]
@@ -1290,9 +1302,13 @@ def score_candidates_with_EI_and_prior(
     else:
         prior = np.ones_like(EI)
 
-    # 6) 综合分数
-    score = EI * prior
-
+    # 6) 综合分数：EI × StageB 先验 × 瓶型“可行概率”
+    if bottle_model is not None and bottle_penalty_weight > 0:
+        # 上面已经算过 bottle_prob_cand
+        p_feas = 1.0 - bottle_prob_cand
+    else:
+        p_feas = np.ones_like(EI)
+    score = EI * prior * p_feas
     info = {
         "X_candidates": X_cand,
         "mu_real": mu_real,
@@ -1314,26 +1330,6 @@ def select_topK_recipes(
     score_info: dict,
     topK: Optional[int] = None,
 ) -> dict:
-    """
-    根据 Block E 的打分结果，选出前 topK 条推荐 recipe。
-
-    输入：
-      cfg        : ExpConfig
-      score_info : score_candidates_with_EI_and_prior 的返回值
-      topK       : 选取数量（默认 cfg.n_select）
-
-    输出：
-      {
-        "X_selected": (K,D)  推荐静态参数
-        "mu_real":    (K,3)  多保真预测均值
-        "sigma_real": (K,3)  多保真预测不确定度
-        "EI":         (K,)
-        "prior":      (K,)
-        "score":      (K,)
-        "indices":    (K,)   在候选池中的原始索引
-        "J_best":     标量   当前已知最佳 J
-      }
-    """
     X_cand = score_info["X_candidates"]
     score = score_info["score"]
     J_mu = np.asarray(score_info["J_mu"], dtype=np.float64)
@@ -1383,19 +1379,6 @@ def save_results_advanced(
     selected: dict,
     oracle: "StageBOracle",
 ):
-    """
-    保存选点结果到 Excel + CSV：
-      - sheet1: 推荐清单（多保真预测 + StageB 预测 + EI + 先验 + score）
-      - sheet2: 候选池评分（用于分析 EI 分布）
-      - sheet3: 新表实测（X_new + d_new）
-      - sheet4: StageB_相关性（Pearson / Spearman）
-      - sheet5: ActiveSubspace（特征值、能量占比、主方向权重）
-      - sheet6: Surrogate_R2（StageB vs 多保真 R²）
-      - sheet7: StageB筛选（StageB 眼里好的候选）
-
-    同时导出一个 CSV：
-      - 推荐recipe清单.csv：便于直接丢给设备/仿真脚本
-    """
     ensure_dir(cfg.save_dir)
     excel_path = os.path.join(cfg.save_dir, "stageC_advanced_selection.xlsx")
     csv_path = os.path.join(cfg.save_dir, "推荐recipe清单.csv")
@@ -1597,11 +1580,11 @@ def run_advanced_selection(cfg: "ExpConfig") -> dict:
         cfg,
         n_samples=512,
         batch_size=64,
-        target_time="9",
-    )
+        target_time="9")
+    as_info = compute_param_importance_and_trust_region(cfg, corr_info, as_info)
 
     print("\n========== Block C：构建多保真 Residual GP ==========")
-    surrogate = build_multi_fidelity_surrogate(cfg, oracle, X_new, d_new)
+    surrogate = build_multi_fidelity_surrogate(cfg, oracle, X_new, d_new, param_importance=as_info.get("param_importance_combined", None))
 
     print("\n========== Block C+：瓶型惩罚模型 ==========")
     bottle_model = build_bottle_penalty_model(cfg, X_new, bottle_flag)
@@ -1610,13 +1593,8 @@ def run_advanced_selection(cfg: "ExpConfig") -> dict:
     cand_info = generate_candidates_with_stageB(
         cfg=cfg,
         oracle=oracle,
-        as_info=as_info,
-        oversample_factor=2.0,
-        stageB_keep_ratio=0.5,
-        n_grad_steps=cfg.stageB_grad_steps,
-        grad_lr=0.5,
-        subspace_dim=1,
-    )
+        as_info=as_info)
+
     print("\n========== Block E：多保真打分 + 先验 + 瓶型惩罚 ==========")
     score_info = score_candidates_with_EI_and_prior(
         cfg=cfg,
@@ -1658,10 +1636,20 @@ def run_advanced_selection(cfg: "ExpConfig") -> dict:
         "score_info": score_info,
         "selected": selected,
     }
-
-
 if __name__ == "__main__":
-    cfg = ExpConfig()
-    ensure_dir(cfg.save_dir)
-    _ = run_advanced_selection(cfg)
+    # 想对比的瓶型惩罚权重
+    penalty_list = [0.0, 1.0, 2.0]
 
+    for w in penalty_list:
+        cfg = ExpConfig()
+        cfg.bottle_penalty_weight = w
+
+        # 每个权重单独一个保存目录，避免 Excel / CSV 覆盖
+        cfg.save_dir = f"./stageC_BO_penalty_{w:g}"
+        ensure_dir(cfg.save_dir)
+
+        print("\n" + "=" * 80)
+        print(f"运行主动选点：bottle_penalty_weight = {w}")
+        print("=" * 80)
+
+        _ = run_advanced_selection(cfg)
