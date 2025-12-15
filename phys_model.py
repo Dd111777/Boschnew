@@ -48,7 +48,180 @@ class PhysicsSeqPredictor(nn.Module):
         y = self.head(x)                                       # (B,T,2)
         return y.transpose(1,2)                                # (B,2,T)
 
-# ---------------- 形貌网 ----------------
+# ---------------- 物理网 Baseline：MLP ----------------
+class PhysicsMLPBaseline(nn.Module):
+    """不使用 Transformer，只用逐时间步 MLP 的基线模型。
+
+    接口保持与 PhysicsSeqPredictor 一致：
+      forward(static_7, time_values) -> (B, 2, T)
+    """
+    def __init__(self, hidden_dim: int = 128, num_layers: int = 3, T: int = 10):
+        super().__init__()
+        self.T = T
+        self.time_mlp = nn.Sequential(
+            nn.Linear(1, 16),
+            nn.GELU(),
+            nn.Linear(16, 32),
+        )
+        in_dim = 7 + 32  # 7 个静态输入 + 32 维时间嵌入
+        layers = []
+        d_in = in_dim
+        for _ in range(max(1, num_layers - 1)):
+            layers.append(nn.Linear(d_in, hidden_dim))
+            layers.append(nn.GELU())
+            d_in = hidden_dim
+        layers.append(nn.Linear(d_in, 2))  # 直接回归 F / Ion
+        self.mlp = nn.Sequential(*layers)
+
+    def forward(self, static_7, time_values):
+        B = static_7.size(0)
+        if time_values.dim() == 1:
+            time_values = time_values.unsqueeze(0).expand(B, -1)
+        T = time_values.size(1)
+        if T != self.T:
+            raise ValueError(f"T mismatch: {T} vs {self.T}")
+        t_embed = self.time_mlp(time_values.unsqueeze(-1))  # (B,T,32)
+        s = static_7.unsqueeze(1).expand(B, T, -1)          # (B,T,7)
+        x = torch.cat([s, t_embed], dim=-1)                 # (B,T,7+32)
+        y = self.mlp(x)                                     # (B,T,2)
+        return y.transpose(1, 2)                            # (B,2,T)
+
+
+# ---------------- 物理网 Baseline：GRU ----------------
+class PhysicsGRUBaseline(nn.Module):
+    """使用 GRU 建模时间相关性的基线模型。
+
+    接口保持与 PhysicsSeqPredictor 一致：
+      forward(static_7, time_values) -> (B, 2, T)
+    """
+    def __init__(self, hidden_dim: int = 128, num_layers: int = 1, T: int = 10, dropout: float = 0.0):
+        super().__init__()
+        self.T = T
+        self.time_mlp = nn.Sequential(
+            nn.Linear(1, 16),
+            nn.GELU(),
+            nn.Linear(16, 32),
+        )
+        in_dim = 7 + 32
+        self.gru = nn.GRU(
+            input_size=in_dim,
+            hidden_size=hidden_dim,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=dropout if num_layers > 1 else 0.0,
+        )
+        self.head = nn.Linear(hidden_dim, 2)
+
+    def forward(self, static_7, time_values):
+        B = static_7.size(0)
+        if time_values.dim() == 1:
+            time_values = time_values.unsqueeze(0).expand(B, -1)
+        T = time_values.size(1)
+        if T != self.T:
+            raise ValueError(f"T mismatch: {T} vs {self.T}")
+        t_embed = self.time_mlp(time_values.unsqueeze(-1))  # (B,T,32)
+        s = static_7.unsqueeze(1).expand(B, T, -1)          # (B,T,7)
+        x = torch.cat([s, t_embed], dim=-1)                 # (B,T,7+32)
+        out, _ = self.gru(x)                                # (B,T,H)
+        y = self.head(out)                                  # (B,T,2)
+        return y.transpose(1, 2)                            # (B,2,T)
+class TemporalRegressorMLP(nn.Module):
+    """
+    时间步独立 MLP 基线:
+      每个时间步的特征 [static(7), phys(2), t(1)] -> K
+      不显式建模时间相关性
+    """
+    def __init__(self, K: int, hidden_dim: int = 128, num_layers: int = 2, T: int = 10):
+        super().__init__()
+        self.K = K
+        self.T = T
+        in_feat = 7 + 2 + 1
+        layers = []
+        dim_in = in_feat
+        for _ in range(num_layers):
+            layers.append(nn.Linear(dim_in, hidden_dim))
+            layers.append(nn.GELU())
+            dim_in = hidden_dim
+        layers.append(nn.Linear(dim_in, K))   # 每个时间步直接输出 K 维
+        self.mlp = nn.Sequential(*layers)
+
+    def forward(self, static_8: torch.Tensor, phys_2T: torch.Tensor, tvals: torch.Tensor):
+        B = static_8.size(0)
+        T = phys_2T.size(-1)
+        assert T == self.T, f"T mismatch: got {T}, expect {self.T}"
+
+        phys_bt2 = phys_2T.transpose(1, 2).contiguous()     # (B,T,2)
+        static_bt7 = static_8.unsqueeze(1).expand(B, T, 7)  # (B,T,7)
+
+        if tvals.dim() == 1:
+            t_bt1 = tvals.unsqueeze(0).expand(B, T).unsqueeze(-1)  # (B,T,1)
+        else:
+            t_bt1 = tvals.unsqueeze(-1)                             # (B,T,1)
+        t_bt1 = t_bt1 / float(T)
+
+        x = torch.cat([static_bt7, phys_bt2, t_bt1], dim=-1)  # (B,T,10)
+        y = self.mlp(x)                                       # (B,T,K)
+        return y.permute(0, 2, 1).contiguous()                # (B,K,T)
+class TemporalRegressorGRU(nn.Module):
+    """
+    GRU 基线：
+      用 GRU 建模时间相关性，再用逐 family 线性头输出 (B,K,T)
+    """
+    def __init__(self,
+                 K: int,
+                 hidden_dim: int = 128,
+                 num_layers: int = 1,
+                 dropout: float = 0.1,
+                 T: int = 10):
+        super().__init__()
+        self.K = K
+        self.T = T
+        in_feat = 7 + 2 + 1
+
+        self.input_proj = nn.Linear(in_feat, hidden_dim)
+        self.gru = nn.GRU(
+            input_size=hidden_dim,
+            hidden_size=hidden_dim,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=dropout if num_layers > 1 else 0.0,
+            bidirectional=False,
+        )
+        self.heads = nn.ModuleList([nn.Linear(hidden_dim, 1) for _ in range(K)])
+
+        self._reset_parameters()
+
+    def _reset_parameters(self):
+        nn.init.trunc_normal_(self.input_proj.weight, std=0.02)
+        nn.init.zeros_(self.input_proj.bias)
+        for h in self.heads:
+            nn.init.trunc_normal_(h.weight, std=0.02)
+            nn.init.zeros_(h.bias)
+
+    def forward(self, static_8: torch.Tensor, phys_2T: torch.Tensor, tvals: torch.Tensor):
+        B = static_8.size(0)
+        T = phys_2T.size(-1)
+        assert T == self.T, f"T mismatch: got {T}, expect {self.T}"
+
+        phys_bt2 = phys_2T.transpose(1, 2).contiguous()     # (B,T,2)
+        static_bt7 = static_8.unsqueeze(1).expand(B, T, 7)  # (B,T,7)
+
+        if tvals.dim() == 1:
+            t_bt1 = tvals.unsqueeze(0).expand(B, T).unsqueeze(-1)  # (B,T,1)
+        else:
+            t_bt1 = tvals.unsqueeze(-1)
+        t_bt1 = t_bt1 / float(T)
+
+        x = torch.cat([static_bt7, phys_bt2, t_bt1], dim=-1)  # (B,T,10)
+        x = self.input_proj(x)
+        h_seq, _ = self.gru(x)                               # (B,T,H)
+
+        outs = []
+        for k in range(self.K):
+            yk = self.heads[k](h_seq).squeeze(-1)            # (B,T)
+            outs.append(yk.unsqueeze(1))
+        return torch.cat(outs, dim=1)                        # (B,K,T)
+
 class SinusoidalPositionalEncoding(nn.Module):
     """标准正弦位置编码（不可学习），支持 batch_first=True 的 (B, T, C) 输入。"""
     def __init__(self, d_model: int, max_len: int = 1024):

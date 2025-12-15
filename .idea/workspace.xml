@@ -4,7 +4,15 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="089379c4-7cfb-4299-905f-3a8550c713ee" name="更改" comment="12.10" />
+    <list default="true" id="089379c4-7cfb-4299-905f-3a8550c713ee" name="更改" comment="12.10">
+      <change afterPath="$PROJECT_DIR$/compare_meas_vs_sim.py" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/scallop_geom.py" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/stageB_explain_analysis.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/phys_model.py" beforeDir="false" afterPath="$PROJECT_DIR$/phys_model.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/stageA_train_phys_pycharm.py" beforeDir="false" afterPath="$PROJECT_DIR$/stageA_train_phys_pycharm.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/stageB_train_morph_on_old_pycharm.py" beforeDir="false" afterPath="$PROJECT_DIR$/stageB_train_morph_on_old_pycharm.py" afterDir="false" />
+    </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
     <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
@@ -18,6 +26,12 @@
     </option>
   </component>
   <component name="Git.Settings">
+    <option name="PUSH_TAGS">
+      <GitPushTagMode>
+        <option name="argument" value="--tags" />
+        <option name="title" value="All" />
+      </GitPushTagMode>
+    </option>
     <option name="RECENT_GIT_ROOT_PATH" value="$PROJECT_DIR$" />
   </component>
   <component name="GitHubPullRequestSearchHistory">{
@@ -26,13 +40,10 @@
     &quot;assignee&quot;: &quot;Dd111777&quot;
   }
 }</component>
-  <component name="GithubDefaultAccount">
-    <option name="defaultAccountId" value="2c46bef3-26b9-4c23-98f1-8bb513ad9da5" />
-  </component>
   <component name="GithubPullRequestsUISettings">{
   &quot;selectedUrlAndAccountId&quot;: {
     &quot;url&quot;: &quot;https://github.com/Dd111777/Bosch.git&quot;,
-    &quot;accountId&quot;: &quot;2c46bef3-26b9-4c23-98f1-8bb513ad9da5&quot;
+    &quot;accountId&quot;: &quot;492dfcf7-a96c-44ab-93cc-a0b19217d32a&quot;
   }
 }</component>
   <component name="ProblemsViewState">
@@ -47,19 +58,21 @@
     <option name="hideEmptyMiddlePackages" value="true" />
     <option name="showLibraryContents" value="true" />
   </component>
-  <component name="PropertiesComponent"><![CDATA[{
-  "keyToString": {
-    "Python.analyze_distrbution.executor": "Run",
-    "Python.plasma.executor": "Run",
-    "Python.stageCselection.executor": "Run",
-    "Python.test.executor": "Run",
-    "RunOnceActivity.ShowReadmeOnStart": "true",
-    "RunOnceActivity.git.unshallow": "true",
-    "git-widget-placeholder": "master",
-    "last_opened_file_path": "D:/PycharmProjects/Bosch",
-    "settings.editor.selected.configurable": "org.jetbrains.plugins.github.ui.GithubSettingsConfigurable"
+  <component name="PropertiesComponent">{
+  &quot;keyToString&quot;: {
+    &quot;Python.analyze_distrbution.executor&quot;: &quot;Run&quot;,
+    &quot;Python.plasma.executor&quot;: &quot;Run&quot;,
+    &quot;Python.sss.executor&quot;: &quot;Run&quot;,
+    &quot;Python.stageC_finetune_joint_on_new_pycharm_new.executor&quot;: &quot;Run&quot;,
+    &quot;Python.stageCselection.executor&quot;: &quot;Run&quot;,
+    &quot;Python.test.executor&quot;: &quot;Run&quot;,
+    &quot;RunOnceActivity.ShowReadmeOnStart&quot;: &quot;true&quot;,
+    &quot;RunOnceActivity.git.unshallow&quot;: &quot;true&quot;,
+    &quot;git-widget-placeholder&quot;: &quot;master&quot;,
+    &quot;last_opened_file_path&quot;: &quot;D:/PycharmProjects/Bosch&quot;,
+    &quot;settings.editor.selected.configurable&quot;: &quot;org.jetbrains.plugins.github.ui.GithubSettingsConfigurable&quot;
   }
-}]]></component>
+}</component>
   <component name="SharedIndexes">
     <attachedChunks>
       <set>
@@ -151,7 +164,23 @@
       <option name="project" value="LOCAL" />
       <updated>1765343636812</updated>
     </task>
-    <option name="localTasksCounter" value="10" />
+    <task id="LOCAL-00010" summary="12.10">
+      <option name="closed" value="true" />
+      <created>1765343760804</created>
+      <option name="number" value="00010" />
+      <option name="presentableId" value="LOCAL-00010" />
+      <option name="project" value="LOCAL" />
+      <updated>1765343760804</updated>
+    </task>
+    <task id="LOCAL-00011" summary="12.10">
+      <option name="closed" value="true" />
+      <created>1765343820591</created>
+      <option name="number" value="00011" />
+      <option name="presentableId" value="LOCAL-00011" />
+      <option name="project" value="LOCAL" />
+      <updated>1765343820591</updated>
+    </task>
+    <option name="localTasksCounter" value="12" />
     <servers />
   </component>
   <component name="Vcs.Log.Tabs.Properties">
