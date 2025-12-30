@@ -7,8 +7,6 @@ from physio_util import (
     FAMILIES, TIME_LIST, F2IDX, T2IDX
 )
 
-OLD_EXCEL = r"D:\PycharmProjects\Bosch\case.xlsx"
-NEW_EXCEL = r"D:\PycharmProjects\Bosch\Bosch.xlsx"
 SHEET = "case"  # 你 StageB/C 用的
 
 def get_old_static_and_targets_phys():
