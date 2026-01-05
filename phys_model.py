@@ -21,18 +21,20 @@ def build_sincos_pos(d_model, T):
 
 # ---------------- 物理网 ----------------
 class PhysicsSeqPredictor(nn.Module):
-    def __init__(self, d_model=140, nhead=7, num_layers=4, dim_ff=256, dropout=0.1, T=10):
+    def __init__(self, d_model=140, nhead=7, num_layers=4, dim_ff=256, dropout=0.1, T=10,
+                 in_dim=7, out_dim=2):
         super().__init__()
         self.T = T
+        self.out_dim = out_dim
         self.time_mlp = nn.Sequential(nn.Linear(1,16), nn.GELU(), nn.Linear(16,32))
-        self.input_proj = nn.Linear(7+32, d_model)
+        self.input_proj = nn.Linear(in_dim + 32, d_model)
         self.pos = build_sincos_pos(d_model, T)
         enc = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead,
                                          dim_feedforward=dim_ff, dropout=dropout,
                                          batch_first=True, activation="gelu")
         self.encoder = nn.TransformerEncoder(enc, num_layers=num_layers)
         self.norm = nn.LayerNorm(d_model)
-        self.head = nn.Linear(d_model, 2)
+        self.head = nn.Linear(d_model, out_dim)
 
     def forward(self, static_8, time_values):
         B = static_8.size(0)
@@ -49,42 +51,48 @@ class PhysicsSeqPredictor(nn.Module):
         return y.transpose(1,2)                                # (B,2,T)
 
 # ---------------- 物理网 Baseline：MLP ----------------
-class PhysicsMLPBaseline(nn.Module):
-    """不使用 Transformer，只用逐时间步 MLP 的基线模型。
+# phys_model.py
 
-    接口保持与 PhysicsSeqPredictor 一致：
-      forward(static_7, time_values) -> (B, 2, T)
-    """
-    def __init__(self, hidden_dim: int = 128, num_layers: int = 3, T: int = 10):
+class PhysicsMLPBaseline(nn.Module):
+    def __init__(self, hidden_dim=128, num_layers=2, dropout=0.1, T=10, in_dim=7, out_dim=7):
         super().__init__()
         self.T = T
+        self.in_dim = in_dim
+        self.out_dim = out_dim
+
         self.time_mlp = nn.Sequential(
             nn.Linear(1, 16),
             nn.GELU(),
             nn.Linear(16, 32),
         )
-        in_dim = 7 + 32  # 7 个静态输入 + 32 维时间嵌入
+
+        d_in = in_dim + 32
         layers = []
-        d_in = in_dim
         for _ in range(max(1, num_layers - 1)):
             layers.append(nn.Linear(d_in, hidden_dim))
             layers.append(nn.GELU())
+            if dropout and dropout > 0:
+                layers.append(nn.Dropout(dropout))
             d_in = hidden_dim
-        layers.append(nn.Linear(d_in, 2))  # 直接回归 F / Ion
+
+        # ✅ 最后一层直接输出 out_dim（不要先输出 2 再接别的层）
+        layers.append(nn.Linear(d_in, out_dim))
         self.mlp = nn.Sequential(*layers)
 
-    def forward(self, static_7, time_values):
-        B = static_7.size(0)
+    def forward(self, static_x, time_values):
+        B = static_x.size(0)
         if time_values.dim() == 1:
             time_values = time_values.unsqueeze(0).expand(B, -1)
         T = time_values.size(1)
         if T != self.T:
             raise ValueError(f"T mismatch: {T} vs {self.T}")
-        t_embed = self.time_mlp(time_values.unsqueeze(-1))  # (B,T,32)
-        s = static_7.unsqueeze(1).expand(B, T, -1)          # (B,T,7)
-        x = torch.cat([s, t_embed], dim=-1)                 # (B,T,7+32)
-        y = self.mlp(x)                                     # (B,T,2)
-        return y.transpose(1, 2)                            # (B,2,T)
+
+        t_embed = self.time_mlp(time_values.unsqueeze(-1))   # (B,T,32)
+        s = static_x.unsqueeze(1).expand(B, T, self.in_dim)  # (B,T,in_dim)
+        x = torch.cat([s, t_embed], dim=-1)                  # (B,T,in_dim+32)
+
+        y = self.mlp(x)                                      # (B,T,out_dim)
+        return y.transpose(1, 2)                             # (B,out_dim,T)
 
 
 # ---------------- 物理网 Baseline：GRU ----------------
@@ -94,9 +102,10 @@ class PhysicsGRUBaseline(nn.Module):
     接口保持与 PhysicsSeqPredictor 一致：
       forward(static_7, time_values) -> (B, 2, T)
     """
-    def __init__(self, hidden_dim: int = 128, num_layers: int = 1, T: int = 10, dropout: float = 0.0):
+    def __init__(self, hidden_dim: int = 128, num_layers: int = 1, T: int = 10, dropout: float = 0.0, out_dim: int = 2):
         super().__init__()
         self.T = T
+        self.out_dim = out_dim
         self.time_mlp = nn.Sequential(
             nn.Linear(1, 16),
             nn.GELU(),
@@ -110,7 +119,7 @@ class PhysicsGRUBaseline(nn.Module):
             batch_first=True,
             dropout=dropout if num_layers > 1 else 0.0,
         )
-        self.head = nn.Linear(hidden_dim, 2)
+        self.head = nn.Linear(hidden_dim, out_dim)
 
     def forward(self, static_7, time_values):
         B = static_7.size(0)

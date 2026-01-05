@@ -546,3 +546,94 @@ def residual_hist(yhat_disp, ytrue_disp, mask, out_png, title):
     plt.figure(figsize=(4.6,3.6))
     plt.hist(diff, bins=40)
     plt.title(title); plt.tight_layout(); plt.savefig(out_png, dpi=200); plt.close()
+
+def excel_to_phys7_dataset_from_iedf(excel_path: str, sheet_name=None,
+                                    case_id_col: str = "input",
+                                    iedf_root: str = r"D:\BaiduNetdiskDownload\TSV",
+                                    dropna: bool = True):
+    """
+    输入：case.xlsx（含 recipe 7维 + case_id）
+    标签：从 IEDF 文件夹在线计算 Phys7（7维）
+    输出：TensorDataset(x_norm, y_norm, y_mask) + meta
+    """
+    import numpy as np, torch
+    import pandas as pd
+    from torch.utils.data import TensorDataset
+    from extract_phys7_from_iedf import compute_phys7_for_case, normalize_case_id
+
+    df = pd.read_excel(excel_path, sheet_name=sheet_name)
+    cols = list(df.columns)
+    if case_id_col not in cols:
+        raise KeyError(f"case_id_col='{case_id_col}' 不存在，现有列：{cols}")
+
+    # recipe7 列（复用你 excel_to_physics_dataset 的匹配规则）
+    key_alias = {
+        "apc": ["apc"],
+        "source_rf": ["source_rf", "sourcerf", "rfsource", "e2"],
+        "lf_rf": ["lf_rf", "lfrf", "bias"],
+        "sf6": ["sf6"],
+        "c4f8": ["c4f8"],
+        "dep_time": ["deptime", "dep_time", "depositiontime"],
+        "etch_time": ["etchtime", "etch_time"],
+    }
+    static_keys = [
+        _pick_one(cols, key_alias["apc"]),
+        _pick_one(cols, key_alias["source_rf"]),
+        _pick_one(cols, key_alias["lf_rf"]),
+        _pick_one(cols, key_alias["sf6"]),
+        _pick_one(cols, key_alias["c4f8"]),
+        _pick_one(cols, key_alias["dep_time"]),
+        _pick_one(cols, key_alias["etch_time"]),
+    ]
+    if not all(static_keys):
+        raise RuntimeError(f"recipe7 输入列不全：{static_keys}")
+
+    X = df[static_keys].to_numpy(np.float32)
+    x_mean = X.mean(axis=0, keepdims=True)
+    x_std  = X.std(axis=0, keepdims=True) + 1e-6
+    Xn = (X - x_mean) / x_std
+
+    phys_cols = [
+        "logGamma_SF6_tot","pF_SF6","spread_SF6","qskew_SF6",
+        "logGamma_C4F8_tot","rho_C4F8","spread_C4F8"
+    ]
+
+    Y = np.full((len(df), len(phys_cols)), np.nan, np.float32)
+    for i, cid0 in enumerate(df[case_id_col].astype(str).tolist()):
+        cid = normalize_case_id(cid0)
+        feat = compute_phys7_for_case(cid, iedf_root=iedf_root)
+        for j, k in enumerate(phys_cols):
+            Y[i, j] = np.float32(feat.get(k, np.nan))
+
+    y_mask = np.isfinite(Y)
+    if dropna:
+        keep = y_mask.all(axis=1)
+        df = df.loc[keep].reset_index(drop=True)
+        Xn = Xn[keep]
+        Y  = Y[keep]
+        y_mask = y_mask[keep]
+
+    # y 标准化（列内）
+    y_mean = np.zeros((1, Y.shape[1]), np.float32)
+    y_std  = np.ones((1, Y.shape[1]), np.float32)
+    Yn = Y.copy()
+    for j in range(Y.shape[1]):
+        vals = Y[:, j][y_mask[:, j]]
+        m = float(vals.mean()) if vals.size else 0.0
+        s = float(vals.std() + 1e-6) if vals.size else 1.0
+        y_mean[0, j] = m
+        y_std[0, j] = s
+        Yn[:, j] = (Y[:, j] - m) / s
+
+    ds = TensorDataset(
+        torch.from_numpy(Xn),
+        torch.from_numpy(Yn),
+        torch.from_numpy(y_mask.astype(np.bool_)),
+    )
+    meta = {
+        "recipe_cols": static_keys,
+        "phys7_cols": phys_cols,
+        "norm_x": {"mean": torch.from_numpy(x_mean), "std": torch.from_numpy(x_std)},
+        "norm_y": {"mean": torch.from_numpy(y_mean), "std": torch.from_numpy(y_std)},
+    }
+    return ds, meta, df

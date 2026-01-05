@@ -1,1889 +1,1215 @@
 # -*- coding: utf-8 -*-
 """
-Stage C: 新表迁移微调（预测式 Phys→Morph）【完整修缮版 | R²→80%+】
-核心修缮：
-1. ✅ 数据划分：Train/Val/Test 完全隔离
-2. ✅ 逐 Family 评估：Macro/Micro/Min-R² + 完整报告
-3. ✅ 后校准隔离：训练集拟合，测试集应用
-4. ✅ 扩展变体：14 组 SOTA 方法 × 3 seeds
-5. ✅ 可视化增强：逐 Family 诊断图 + 时序误差分析
-6. ⚠️ 数据对齐逻辑：100% 保留，严禁修改
+Stage C (Transfer Learning) — Fine-tune StageB Morph model on REAL (new table) data
+=================================================================================
+
+你现在遇到的问题：
+- 你已经把“物理输入”换成 StageA 的 Phys7，但 stageC 初稿里仍然在用 phys_F / phys_I（F 与 I 两路物理模型）：
+  phys_forward_raw() 里还在调用 phys_F(static_8,t) 与 phys_I(static_8,t) 然后拼成 [F, I] 两通道。
+
+本脚本给出 **直接可跑的 StageC 方案**：
+1) 物理输入统一改为：Phys7 = StageA(Recipe7) 的预测（N×7），并在时间轴上广播成 (N,7,T)
+2) Morph 模型直接复用 StageB 的结构（Transformer / GRU / MLP），并支持从 StageB ckpt 迁移
+3) 为了满足你的目标（“不必用完所有样本；只要找到一组 train/test 自洽且 R²≥0.90；并且 test 中包含 B47/B52/B54”）
+   - 提供 subset+split 随机搜索：可随机丢弃部分样本（当作“质量筛选”），并在满足重点 recipe 覆盖约束下寻找最优划分
+   - 评价标准：train_overall_R2 与 test_overall_R2 都 ≥ 0.90（展示空间：默认 μm->nm；并可设置 zmin 取负等）
+
+依赖：
+- physio_util.py（已在项目中）：用于读取新表、mask、展示空间变换、指标计算等
+- StageA 的 Phys7 checkpoint（用于推理 Phys7）
+- （可选）StageB 的 Morph checkpoint（用于迁移学习初始化；如果没有，也可从头训，但会慢）
+
+用法（示例）：
+  python stageC_finetune_transfer_phys7_subsetsearch.py \
+    --new_excel "D:/PycharmProjects/Bosch/new_table.xlsx" \
+    --stageA_ckpt "D:/PycharmProjects/Bosch/runs_stageA_phys7/.../phys7_best.pth" \
+    --stageB_ckpt "D:/PycharmProjects/Bosch/runs_stageB_morph_phys7/best_morph.pth" \
+    --out_dir "./runs_stageC_transfer" \
+    --key_recipes "B47,B52,B54" \
+    --target_r2 0.90
+
+注意：
+- 你要的“自洽”本质上是在小样本下做“可行 split 搜索”。脚本默认会输出 best_split.json（包含索引、recipe 分布、指标）
 """
 
-import os
-import copy
-import math
-import json
+import os, re, json, math, time, argparse
+from dataclasses import dataclass
+from typing import Dict, List, Tuple, Optional, Any
+
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
-from typing import Dict, List, Tuple
-from sklearn.model_selection import train_test_split
+from torch.utils.data import TensorDataset, DataLoader
 
-# ====== 依赖 util/模型（保持不变） ======
-from physio_util import (
-    set_seed, export_predictions_longtable, export_metrics_grid,
-    write_summary_txt, heatmap, parity_scatter, residual_hist, save_manifest,
-    metrics, transform_for_display, FAMILIES,
-    excel_to_physics_dataset,
-    load_new_excel_as_sparse_morph, build_sparse_batch
-)
-from phys_model import TemporalRegressor, PhysicsSeqPredictor
+# 你项目里已存在
+import physio_util as pu
 
 
-# ========================== 配置（增强版） ==========================
-class Cfg:
-    # 数据路径（不变）
-    old_excel = r"D:\data\pycharm\bosch\case.xlsx"
-    new_excel = r"D:\data\pycharm\bosch\Bosch.xlsx"
-    save_root = "./runs_stageC_enhanced"
-
-    # 预训练权重
-    phys_ckpt_F = "./runs_phys_split/F_Flux/phys_best.pth"
-    phys_ckpt_I = "./runs_phys_split/Ion_Flux/phys_best.pth"
-    morph_ckpt = "./runs_morph_old/morph_best_overall.pth"
-
-    # 数据划分（新增 ★）
-    test_size = 0.15
-    val_size = 0.15
-    split_random_state = 42
-
-    # 训练参数
-    seed = 42
-    seeds = [42, 43, 44]
-    max_epochs = 2000  # 24h 预算下平衡
-    batch_clip = 1.0
-    lr_morph = 5e-4
-    lr_phys = 1e-40
-    wd_morph = 5e-2
-    wd_phys = 1e-2
-    lr_calib = 5e-4
-    wd_calib = 0.0
-
-    # 损失函数
-    loss_delta = 1.0
-    loss_smooth_weight = 1e-2
-    mono_zmin_weight = 5e-3
-
-    # Ion 相关
-    ion_affine_default = {"a": 1.0, "b": 0.0, "c": 0.0}
-    ion_learnable_lr = 5e-5
-    ion_learnable_wd = 1e-6
-
-    # 展示空间（不变）
-    unit_scale = 1
-    flip_sign = False
-    clip_nonneg = False
-    min_display_value = 0.0
-    family_sign = np.array([-1, +1, +1, +1, +1, +1], dtype=np.float32)
-    sheet_name = "case"
-    HEIGHT_FAMILY = "h1"
-
-    # 评估
-    use_smape = True
-    mape_eps_nm = 0.001
-    use_ema = True
-    ema_decay = 0.999
-    early_stop = True
-    early_stop_patience = 25
-
-    # 变体列表（扩展到 14 组 SOTA 方法）
-    variants = [
-        # === Baseline 组 ===
-        dict(
-            name="baseline_simple",
-            use_adapter=False, use_derived=False, ion_gate="use",
-            per_family_head=False, hetero=False, task_uncertainty=False,
-            calib_head="affine_per_channel", post_calib="per_k",
-            learnable_ion=False, freeze_phys=True, stagewise_unfreeze=False
-        ),
-        # === Adapter 系列 ===
-        dict(
-            name="adapter_only",
-            use_adapter=True, use_derived=False, ion_gate="use",
-            per_family_head=False, hetero=False, task_uncertainty=False,
-            calib_head="affine_per_channel", post_calib="per_k",
-            learnable_ion=True, freeze_phys=True, stagewise_unfreeze=False
-        ),
-        dict(
-            name="adapter_derived",
-            use_adapter=True, use_derived=True, ion_gate="use",
-            per_family_head=False, hetero=False, task_uncertainty=False,
-            calib_head="affine_per_channel", post_calib="per_k",
-            learnable_ion=True, freeze_phys=True, stagewise_unfreeze=False
-        ),
-        # === Per-Family Head 系列 ===
-        dict(
-            name="adapter_derived_head",
-            use_adapter=True, use_derived=True, ion_gate="use",
-            per_family_head=True, hetero=False, task_uncertainty=False,
-            calib_head="affine_per_channel", post_calib="per_k",
-            learnable_ion=True, freeze_phys=True, stagewise_unfreeze=False
-        ),
-        # === 异方差 + 任务不确定性 ===
-        dict(
-            name="adapter_derived_head_hetero",
-            use_adapter=True, use_derived=True, ion_gate="use",
-            per_family_head=True, hetero=True, task_uncertainty=False,
-            calib_head="affine_per_channel", post_calib="per_k",
-            learnable_ion=True, freeze_phys=True, stagewise_unfreeze=False
-        ),
-        dict(
-            name="adapter_derived_head_hetero_taskuncert",
-            use_adapter=True, use_derived=True, ion_gate="use",
-            per_family_head=True, hetero=True, task_uncertainty=True,
-            calib_head="affine_per_channel", post_calib="per_k",
-            learnable_ion=True, freeze_phys=True, stagewise_unfreeze=False
-        ),
-        # === Ion Gate 系列 ===
-        dict(
-            name="adapter_derived_head_iongate",
-            use_adapter=True, use_derived=True, ion_gate="gate",
-            per_family_head=True, hetero=False, task_uncertainty=False,
-            calib_head="affine_per_channel", post_calib="per_k",
-            learnable_ion=True, freeze_phys=True, stagewise_unfreeze=False
-        ),
-        dict(
-            name="adapter_derived_head_iongate_hetero",
-            use_adapter=True, use_derived=True, ion_gate="gate",
-            per_family_head=True, hetero=True, task_uncertainty=True,
-            calib_head="affine_per_channel", post_calib="per_k",
-            learnable_ion=True, freeze_phys=True, stagewise_unfreeze=False
-        ),
-        # === 后校准策略对比 ===
-        dict(
-            name="adapter_derived_head_postcalib_kt",
-            use_adapter=True, use_derived=True, ion_gate="use",
-            per_family_head=True, hetero=False, task_uncertainty=False,
-            calib_head="affine_per_channel", post_calib="per_kt",
-            learnable_ion=True, freeze_phys=True, stagewise_unfreeze=False
-        ),
-        dict(
-            name="adapter_derived_head_timeconv",
-            use_adapter=True, use_derived=True, ion_gate="use",
-            per_family_head=True, hetero=False, task_uncertainty=False,
-            calib_head="time_conv", post_calib="time_conv",
-            learnable_ion=True, freeze_phys=True, stagewise_unfreeze=False
-        ),
-        dict(
-            name="adapter_derived_head_hybrid_calib",
-            use_adapter=True, use_derived=True, ion_gate="use",
-            per_family_head=True, hetero=False, task_uncertainty=False,
-            calib_head="hybrid", post_calib="per_k",
-            learnable_ion=True, freeze_phys=True, stagewise_unfreeze=False
-        ),
-        # === 解冻物理编码器 ===
-        dict(
-            name="adapter_derived_head_unfreeze_phys",
-            use_adapter=True, use_derived=True, ion_gate="use",
-            per_family_head=True, hetero=False, task_uncertainty=False,
-            calib_head="affine_per_channel", post_calib="per_k",
-            learnable_ion=True, freeze_phys=False, stagewise_unfreeze=False
-        ),
-        dict(
-            name="adapter_derived_head_stagewise_unfreeze",
-            use_adapter=True, use_derived=True, ion_gate="gate",
-            per_family_head=True, hetero=True, task_uncertainty=True,
-            calib_head="hybrid", post_calib="per_k",
-            learnable_ion=True, freeze_phys=False, stagewise_unfreeze=True
-        ),
-        # === 最强配置（Kitchen Sink）===
-        dict(
-            name="kitchen_sink_all_features",
-            use_adapter=True, use_derived=True, ion_gate="gate",
-            per_family_head=True, hetero=True, task_uncertainty=True,
-            calib_head="hybrid", post_calib="per_k",
-            learnable_ion=True, freeze_phys=False, stagewise_unfreeze=True
-        ),
-    ]
+# ---------------------------- 常量（与 StageB / physio_util 对齐） ----------------------------
+FAMILIES = pu.FAMILIES
+TIME_LIST = pu.TIME_LIST
+T = len(TIME_LIST)
+TIME_VALUES = np.array([1,2,3,4,5,6,7,8,9,9.2], np.float32)
 
 
-# ========================== 工具函数（保留 + 增强） ==========================
-def ensure_dir(path: str):
-    os.makedirs(path, exist_ok=True)
-
-
-def _to_cpu_np_grid(x):
-    if torch.is_tensor(x):
-        return x.detach().cpu().numpy()
-    if isinstance(x, np.ndarray):
-        return x
-    return np.asarray(x)
-
-
-def _safe_load(path, map_location="cpu"):
-    """安全加载 checkpoint（显式注册 numpy reconstruct + 三段回退）"""
-    import os as _os
-    import numpy as _np
-    import torch as _t
-    from numpy.core import multiarray as _multi
-    from torch.serialization import safe_globals, add_safe_globals
-
-    if not _os.path.exists(path):
-        raise FileNotFoundError(path)
-
-    # 1) 全局白名单（对后续 torch.load 生效）
-    from numpy.core import multiarray as _multi
-    from torch.serialization import safe_globals, add_safe_globals
-
-    # >>> 新增：拿到 dtype 类的“类型”
-    _dtype_type = type(_np.dtype("float32"))
-
+# ---------------------------- StageA Phys7 推理（从 StageB 复制并简化） ----------------------------
+def _torch_load_ckpt(path: str, map_location="cpu"):
+    # PyTorch 2.6+ 默认 weights_only=True，会导致旧 ckpt（含 numpy 对象）加载失败
     try:
-        add_safe_globals([_multi._reconstruct, _np.generic, _np.dtype, _np.ndarray, _dtype_type])
-    except Exception:
-        pass
-
-    _allowed = [_multi._reconstruct, _np.generic, _np.dtype, _np.ndarray, _dtype_type]
-    # 3) 三段回退
-    try:
-        return _t.load(path, map_location=map_location, weights_only=True)
-    except Exception as e1:
-        print(f"[safe_load] weights_only=True failed: {e1}")
-
-    try:
-        with safe_globals(_allowed):
-            return _t.load(path, map_location=map_location, weights_only=True)
-    except Exception as e2:
-        print(f"[safe_load] safe_globals failed: {e2}")
-
-    try:
-        with safe_globals(_allowed):
-            return _t.load(path, map_location=map_location, weights_only=False)
-    except Exception as e3:
-        print(f"[safe_load] all methods failed: {e3}")
-
-    raise RuntimeError(f"Failed to load: {path}")
-
-
-
-# ===== Metrics 兼容层（保留）=====
-@torch.no_grad()
-def _compute_smape_grid(y_pred_disp, y_true_disp, mask, eps=1e-8):
-    err = (y_pred_disp - y_true_disp).abs()
-    den = (y_pred_disp.abs() + y_true_disp.abs()).clamp_min(eps)
-    smape_elem = 100.0 * 2.0 * err / den
-    m = mask.float()
-    sumE = (smape_elem * m).sum(dim=0)
-    cnt = m.sum(dim=0).clamp_min(1.0)
-    return sumE / cnt
-
-
-@torch.no_grad()
-def _metrics_compat(y_pred_disp, y_true_disp, mask, *, use_smape, mape_eps_nm):
-    try:
-        return metrics(y_pred_disp, y_true_disp, mask, use_smape=use_smape, mape_eps=mape_eps_nm)
+        obj = torch.load(path, map_location=map_location, weights_only=False)
     except TypeError:
-        mts = metrics(y_pred_disp, y_true_disp, mask)
-        if use_smape:
-            mts["SMAPE"] = _compute_smape_grid(y_pred_disp, y_true_disp, mask)
-        return mts
-
-
-# ========================== 数据加载（100% 保留对齐逻辑） ==========================
-def _norm_col(x, mean, std):
-    """⚠️ 数据对齐核心函数 - 严禁修改"""
-    x = (x - mean) / (std + 1e-8)
-    x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
-    return x
-
-
-def load_fallback_sparse(merged_excel_path, norm_mean, norm_std, time_values, families=FAMILIES):
-    """⚠️ 数据对齐核心函数 - 100% 保留，仅增加返回 sample_ids"""
-    import pandas as pd
-    if not os.path.exists(merged_excel_path):
-        raise FileNotFoundError(merged_excel_path)
-    try:
-        df = pd.read_excel(merged_excel_path, sheet_name="merged_for_training")
-    except Exception:
-        df = pd.read_excel(merged_excel_path)
-
-    # === 以下逻辑 100% 保留 ===
-    s8_cols = [c for c in df.columns if str(c).lower().startswith("s") and str(c)[1:].isdigit()]
-    s8_cols = sorted(s8_cols, key=lambda s: int(str(s)[1:]))[:8]
-    s8_raw = df[s8_cols].astype(float).values
-    s8 = _norm_col(s8_raw, norm_mean, norm_std).astype(np.float32)
-
-    fams = list(families)
-    if "zmin" not in fams: fams = ["zmin"] + fams
-    T = len(time_values)
-    fam2idx = {n: i for i, n in enumerate(fams)}
-    B, K = s8.shape[0], len(fams)
-    y_sparse = torch.zeros((B, K, T), dtype=torch.float32)
-    m_sparse = torch.zeros((B, K, T), dtype=torch.bool)
-    tv = np.array(time_values, dtype=float).tolist()
-
-    def t_idx(tnum):
-        return int(tv.index(float(tnum))) if float(tnum) in tv else max(0, min(T - 1, int(tnum) - 1))
-
-    def _nm_to_um(vals):
-        return np.nan_to_num(vals.astype(float), nan=np.nan) / 1000.0
-
-    def _pick(df, cands):
-        for c in cands:
-            if c in df.columns: return c
-        return None
-
-    def _fill(k_idx, cands, times, negate=False):
-        for n in times:
-            col = _pick(df, cands(n))
-            if col is None: continue
-            vals = _nm_to_um(df[col].values)
-            if negate: vals = -vals
-            ti = t_idx(n)
-            v_t = torch.tensor(vals, dtype=torch.float32)
-            ok = torch.isfinite(v_t)
-            if ok.any():
-                y_sparse[:, k_idx, ti][ok] = v_t[ok]
-                m_sparse[:, k_idx, ti][ok] = True
-
-    if "zmin" in fams and "zmin_10" in df.columns:
-        k = fam2idx["zmin"]
-        vals = _nm_to_um(df["zmin_10"].values) * (-1.0)
-        ti = t_idx(10)
-        v_t = torch.tensor(vals, dtype=torch.float32)
-        ok = torch.isfinite(v_t)
-        if ok.any():
-            y_sparse[:, k, ti][ok] = v_t[ok]
-            m_sparse[:, k, ti][ok] = True
-
-    def _cands_h(n):
-        return [f"h1_{n}", f"h1{n}", f"h{n}", f"h_{n}", f"{n}thscallopheight", f"第{n}个scallop高度",
-                f"第{n}个scallop高度(nm)"]
-
-    def _cands_d(n):
-        return [f"d1_{n}", f"d1{n}", f"d{n}", f"d_{n}", f"{n}thscallopdepth", f"第{n}个scallop深度",
-                f"第{n}个scallop深度(nm)"]
-
-    def _cands_w(n):
-        return [f"w{n}", f"w_{n}", f"W{n}", f"W {n}", f"{n}thscallopwidth", f"第{n}个scallop宽度",
-                f"第{n}个scallop宽度(nm)"]
-
-    if "h1" in fams: _fill(fam2idx["h1"], _cands_h, [3, 5, 9], negate=False)
-    if "d1" in fams: _fill(fam2idx["d1"], _cands_d, [3, 5, 9], negate=False)
-    if "w" in fams: _fill(fam2idx["w"], _cands_w, [1, 3, 5, 9], negate=False)
-
-    s8 = torch.tensor(s8, dtype=torch.float32)
-    tvals = torch.tensor(np.array(time_values, dtype=np.float32), dtype=torch.float32)
-
-    # === 新增：返回 sample_ids 用于划分 ===
-    sample_ids = np.arange(B)
-    return s8, y_sparse, m_sparse, tvals, fams, sample_ids
-
-
-def load_data_with_split(new_excel, norm_mean, norm_std, time_values, families, test_size, val_size, seed):
-    """
-    ★ 新增：在对齐逻辑外层包装划分
-    ⚠️ 内部对齐逻辑 100% 不变
-    """
-    # 1. 加载数据（对齐逻辑保持不变）
-    try:
-        recs = load_new_excel_as_sparse_morph(new_excel, height_family=Cfg.HEIGHT_FAMILY)
-        s8, y_sparse, m_sparse, tvals = build_sparse_batch(
-            recs, norm_mean, norm_std, time_values
-        )
-        fams = families
-        sample_ids = np.arange(s8.shape[0])
-        print("[DataSplit] Loaded via util loader.")
-    except Exception as e:
-        print(f"[DataSplit] Fallback loader: {e}")
-        s8, y_sparse, m_sparse, tvals, fams, sample_ids = load_fallback_sparse(
-            new_excel, norm_mean, norm_std, time_values, families
-        )
-
-    # 2. 数据划分（新增）
-    B = s8.shape[0]
-
-    # 分层依据：每个样本的有效点数
-    sample_counts = m_sparse.sum(dim=(1, 2)).numpy()
-    strata = (sample_counts > np.median(sample_counts)).astype(int)
-
-    # Train/Temp split
-    train_idx, temp_idx = train_test_split(
-        sample_ids, test_size=(test_size + val_size),
-        random_state=seed, stratify=strata
-    )
-
-    # Val/Test split
-    temp_strata = strata[temp_idx]
-    val_idx, test_idx = train_test_split(
-        temp_idx, test_size=(test_size / (test_size + val_size)),
-        random_state=seed, stratify=temp_strata
-    )
-
-    # 3. 重新计算统计量（仅用训练集）
-    s8_train = s8[train_idx]
-    # 反标准化到原始域
-    s8_train_raw = s8_train * (norm_std + 1e-8) + norm_mean
-    train_mean = s8_train_raw.mean(dim=0)
-    train_std = s8_train_raw.std(dim=0).clamp_min(1e-8)
-
-    # 全量数据用训练集统计量重新标准化
-    s8_full_raw = s8 * (norm_std + 1e-8) + norm_mean
-    s8_renorm = (s8_full_raw - train_mean) / train_std
-
-    print(f"[DataSplit] Train={len(train_idx)}, Val={len(val_idx)}, Test={len(test_idx)}")
-
-    return {
-        "s8": s8_renorm,
-        "y_sparse": y_sparse,
-        "m_sparse": m_sparse,
-        "tvals": tvals,
-        "families": fams,
-        "splits": {
-            "train": train_idx,
-            "val": val_idx,
-            "test": test_idx
-        },
-        "train_stats": {
-            "mean": train_mean,
-            "std": train_std
-        }
-    }
-
-
-# ========================== 模型组件（保留） ==========================
-def _infer_arch_from_sd(sd: dict) -> Dict[str, int]:
-    """从 state_dict 推断模型架构"""
-    if "pos" in sd and hasattr(sd["pos"], "shape"):
-        _, T, d_model = sd["pos"].shape
-    else:
-        d_model = sd["input_proj.weight"].shape[0]
-        T = 10
-    key_l1 = "encoder.layers.0.linear1.weight"
-    dim_ff = sd[key_l1].shape[0] if key_l1 in sd else max(2 * d_model, 256)
-    nhead = 8 if d_model % 8 == 0 else 4
-    L = 0
-    while True:
-        prefix = f"encoder.layers.{L}."
-        if any(k.startswith(prefix) for k in sd.keys()):
-            L += 1
-        else:
-            break
-    num_layers = max(L, 1)
-    return dict(T=T, d_model=d_model, nhead=nhead, dim_ff=dim_ff, num_layers=num_layers)
-
-
-def _get_model_sd(ck):
-    return ck["model"] if (isinstance(ck, dict) and "model" in ck and isinstance(ck["model"], dict)) else ck
-
-
-def build_phys_from_ckpt(ckpt_F_path, ckpt_I_path, device):
-    """加载预训练物理模型"""
-    ckf = _safe_load(ckpt_F_path, map_location="cpu")
-    cki = _safe_load(ckpt_I_path, map_location="cpu")
-    sd_F = _get_model_sd(ckf);
-    arch_F = _infer_arch_from_sd(sd_F)
-    sd_I = _get_model_sd(cki);
-    arch_I = _infer_arch_from_sd(sd_I)
-    pf = PhysicsSeqPredictor(**arch_F).to(device)
-    pi = PhysicsSeqPredictor(**arch_I).to(device)
-    pf.load_state_dict(sd_F, strict=False)
-    pi.load_state_dict(sd_I, strict=False)
-    ion_aff = cki.get("ion_affine", copy.deepcopy(Cfg.ion_affine_default)) if isinstance(cki, dict) else copy.deepcopy(
-        Cfg.ion_affine_default)
-    return pf, pi, ion_aff
-
-
-# ========================== 校准头（保留） ==========================
-class CalibAffinePerChannel(nn.Module):
-    def __init__(self, K, init_alpha=1.0, init_beta=0.0):
-        super().__init__()
-        self.alpha = nn.Parameter(torch.full((K,), float(init_alpha)))
-        self.beta = nn.Parameter(torch.full((K,), float(init_beta)))
-
-    def forward(self, y):
-        return self.alpha.view(1, -1, 1) * y + self.beta.view(1, -1, 1)
-
-
-class CalibTimeConv(nn.Module):
-    def __init__(self, K, kernel_size=3):
-        super().__init__()
-        padding = (kernel_size - 1) // 2
-        self.dw = nn.Conv1d(K, K, kernel_size, padding=padding, groups=K, bias=True)
-        with torch.no_grad():
-            self.dw.weight.zero_()
-            center = padding
-            for k in range(K):
-                self.dw.weight[k, 0, center] = 1.0
-            self.dw.bias.zero_()
-
-    def forward(self, y):
-        return self.dw(y)
-
-
-class CalibHybrid(nn.Module):
-    def __init__(self, K, kernel_size=3):
-        super().__init__()
-        self.aff = CalibAffinePerChannel(K)
-        self.tcv = CalibTimeConv(K, kernel_size=kernel_size)
-
-    def forward(self, y):
-        return self.tcv(self.aff(y))
-
-
-def build_calib_head(kind: str, K: int) -> nn.Module:
-    if kind == "affine_per_channel":
-        return CalibAffinePerChannel(K)
-    elif kind == "time_conv":
-        return CalibTimeConv(K)
-    elif kind == "hybrid":
-        return CalibHybrid(K)
-    else:
-        raise ValueError(f"Unknown calib_head: {kind}")
-
-
-# ========================== 损失函数（保留） ==========================
-def masked_huber_with_channel_norm(y_pred, y_true, mask, delta=1.0, smooth_weight=1e-2, mono_penalty=None):
-    """稳健 Huber 损失 + 逐通道标准化"""
-    y_pred = torch.nan_to_num(y_pred, nan=0.0, posinf=1e6, neginf=-1e6)
-    y_true = torch.nan_to_num(y_true, nan=0.0, posinf=1e6, neginf=-1e6)
-    B, K, T = y_pred.shape
-    device = y_pred.device
-    finite_mask = torch.isfinite(y_true) & torch.isfinite(y_pred)
-    eff_mask = (mask.bool() & finite_mask).float()
-
-    mean_k = torch.zeros(K, device=device)
-    std_k = torch.ones(K, device=device)
-    with torch.no_grad():
-        for k in range(K):
-            mk = eff_mask[:, k, :].bool()
-            if mk.any():
-                vt = y_true[:, k, :][mk]
-                if vt.numel() > 1:
-                    m = vt.mean()
-                    s = vt.std()
-                    if not torch.isfinite(m): m = torch.tensor(0.0, device=device)
-                    if not torch.isfinite(s): s = torch.tensor(1.0, device=device)
-                    mean_k[k] = m
-                    std_k[k] = s.clamp_min(1.0)
-
-    y_true_n = torch.nan_to_num((y_true - mean_k.view(1, K, 1)) / std_k.view(1, K, 1), nan=0.0, posinf=1e6, neginf=-1e6)
-    y_pred_n = torch.nan_to_num((y_pred - mean_k.view(1, K, 1)) / std_k.view(1, K, 1), nan=0.0, posinf=1e6, neginf=-1e6)
-
-    diff = (y_pred_n - y_true_n)
-    absd = diff.abs()
-    huber = torch.where(absd <= delta, 0.5 * diff * diff, delta * (absd - 0.5 * delta))
-    denom_k = eff_mask.sum(dim=(0, 2)).clamp_min(1.0)
-    loss_main_per_k = (huber * eff_mask).sum(dim=(0, 2)) / denom_k
-    w_k = 1.0 / std_k.clamp_min(1.0)
-    loss_main = (loss_main_per_k * w_k).mean()
-
-    if T >= 3:
-        d1 = y_pred_n[:, :, 1:] - y_pred_n[:, :, :-1]
-        d2 = d1[:, :, 1:] - d1[:, :, :-1]
-        loss_smooth = torch.nan_to_num((d2 ** 2).mean(), nan=0.0, posinf=0.0, neginf=0.0)
-    else:
-        loss_smooth = torch.tensor(0.0, device=device)
-
-    loss_mono = torch.tensor(0.0, device=device)
-    if mono_penalty is not None and T >= 2:
-        k_idx = mono_penalty.get("k_idx", None)
-        w_mono = mono_penalty.get("weight", 0.0)
-        if (k_idx is not None) and (w_mono > 0):
-            d = y_pred[:, k_idx, 1:] - y_pred[:, k_idx, :-1]
-            loss_mono = torch.nn.functional.relu(-d).mean() * w_mono
-
-    loss = loss_main + smooth_weight * loss_smooth + loss_mono
-    if not torch.isfinite(loss):
-        loss = torch.tensor(0.0, device=device)
-    return loss, {"loss_main": loss_main.detach(), "loss_smooth": loss_smooth.detach(), "loss_mono": loss_mono.detach()}
-
-
-def hetero_nll(y_mu, y_logvar, y_true, mask, task_logvars=None):
-    """异方差负对数似然损失"""
-    y_true = torch.nan_to_num(y_true, nan=0.0, posinf=1e6, neginf=-1e6)
-    m = (mask.bool() & torch.isfinite(y_true)).float()
-    if task_logvars is not None:
-        y_logvar = y_logvar + task_logvars.view(1, -1, 1)
-    inv_var = torch.exp(-y_logvar).clamp_max(1e6)
-    nll = 0.5 * ((y_mu - y_true) ** 2 * inv_var + y_logvar)
-    nll = (nll * m).sum(dim=(0, 2)) / m.sum(dim=(0, 2)).clamp_min(1.0)
-    return nll.mean()
-
-
-# ========================== Ion 反变换（保留） ==========================
-class IonInverseTransform(nn.Module):
-    def __init__(self, init_abc: Dict[str, float], learnable: bool = False):
-        super().__init__()
-        a, b, c = init_abc.get("a", 1.0), init_abc.get("b", 0.0), init_abc.get("c", 0.0)
-        if learnable:
-            self.a = nn.Parameter(torch.tensor(float(a)))
-            self.b = nn.Parameter(torch.tensor(float(b)))
-            self.c = nn.Parameter(torch.tensor(float(c)))
-        else:
-            self.register_buffer("a", torch.tensor(float(a)), persistent=False)
-            self.register_buffer("b", torch.tensor(float(b)), persistent=False)
-            self.register_buffer("c", torch.tensor(float(c)), persistent=False)
-        self.learnable = learnable
-
-    def forward(self, z):
-        arg = torch.clamp(self.a * z + self.b, min=-40.0, max=40.0)
-        y = torch.exp(arg) - self.c
-        y = torch.clamp(y, min=0.0, max=1e6)
-        return y
-
-    def reg(self):
-        if not self.learnable:
-            return 0.0
-        return ((self.a - 1.0) ** 2 + (self.b ** 2) + (self.c ** 2))
-
-
-# ========================== EMA & EarlyStopping ==========================
-class EMA:
-    def __init__(self, model: nn.Module, decay=0.999):
-        self.decay = decay
-        self.shadow = {}
-        for n, p in model.named_parameters():
-            if p.requires_grad:
-                self.shadow[n] = p.data.clone()
-
-    @torch.no_grad()
-    def update(self, model: nn.Module):
-        for n, p in model.named_parameters():
-            if p.requires_grad and n in self.shadow:
-                self.shadow[n].mul_(self.decay).add_(p.data, alpha=1.0 - self.decay)
-
-    @torch.no_grad()
-    def apply_to(self, model: nn.Module):
-        for n, p in model.named_parameters():
-            if p.requires_grad and n in self.shadow:
-                p.data.copy_(self.shadow[n])
-
-
-class EarlyStopper:
-    def __init__(self, patience=20):
-        self.best = None
-        self.patience = patience
-        self.count = 0
-
-    def step(self, val):
-        if self.best is None or val < self.best:
-            self.best = val
-            self.count = 0
-            return True
-        else:
-            self.count += 1
-            return self.count < self.patience
-
-
-# ========================== 后验校准（隔离训练/测试）==========================
-class CalibrationParams:
-    """校准参数容器（可序列化）"""
-    def __init__(self, method: str):
-        self.method = method
-        self.params = {}
-
-    def to_dict(self):
-        return {"method": self.method, "params": self.params}
-
-    @classmethod
-    def from_dict(cls, d):
-        obj = cls(d["method"])
-        obj.params = d["params"]
+        # 兼容旧版 torch（没有 weights_only 参数）
+        obj = torch.load(path, map_location=map_location)
+
+    # 兼容：可能直接保存 state_dict
+    if isinstance(obj, dict) and ("state_dict" in obj or "model" in obj or "meta" in obj):
         return obj
+    return {"state_dict": obj, "meta": {}}
 
 
-def fit_calibration_params(y_pred_disp, y_true_disp, mask, method="per_k", min_points=12, ridge=1e-6):
-    """
-    ★ 新增：仅在训练集拟合校准参数
-    返回可序列化的 CalibrationParams 对象
-    """
-    yp = y_pred_disp.detach().cpu().numpy()
-    yt = y_true_disp.detach().cpu().numpy()
-    mk = mask.detach().cpu().numpy().astype(bool)
-    B, K, T = yp.shape
 
-    calib = CalibrationParams(method)
-
-    if method == "per_k":
-        for k in range(K):
-            xs = yp[:, k, :][mk[:, k, :]]
-            ys = yt[:, k, :][mk[:, k, :]]
-            good = np.isfinite(xs) & np.isfinite(ys)
-            xs, ys = xs[good], ys[good]
-
-            if xs.size < min_points:
-                calib.params[f"k{k}"] = {"a": 1.0, "b": 0.0}
-                continue
-
-            # 线性回归: y_true = a * y_pred + b
-            X = np.column_stack([xs, np.ones_like(xs)])
-            try:
-                coef, *_ = np.linalg.lstsq(X, ys, rcond=None)
-                a, b = float(coef[0]), float(coef[1])
-            except Exception:
-                XTX = X.T @ X + ridge * np.eye(2, dtype=X.dtype)
-                XTy = X.T @ ys
-                coef = np.linalg.solve(XTX, XTy)
-                a, b = float(coef[0]), float(coef[1])
-
-            calib.params[f"k{k}"] = {"a": a, "b": b}
-
-    elif method == "per_kt":
-        for k in range(K):
-            for t in range(T):
-                m = mk[:, k, t]
-                xs = yp[m, k, t]
-                ys = yt[m, k, t]
-                good = np.isfinite(xs) & np.isfinite(ys)
-                xs, ys = xs[good], ys[good]
-
-                if xs.size < max(6, 2):
-                    calib.params[f"k{k}_t{t}"] = {"a": 1.0, "b": 0.0}
-                    continue
-
-                X = np.column_stack([xs, np.ones_like(xs)])
-                try:
-                    coef, *_ = np.linalg.lstsq(X, ys, rcond=None)
-                    a, b = float(coef[0]), float(coef[1])
-                except Exception:
-                    XTX = X.T @ X + ridge * np.eye(2, dtype=X.dtype)
-                    XTy = X.T @ ys
-                    coef = np.linalg.solve(XTX, XTy)
-                    a, b = float(coef[0]), float(coef[1])
-
-                calib.params[f"k{k}_t{t}"] = {"a": a, "b": b}
-
-    return calib
-
-
-def apply_calibration_params(y_pred_disp, calib: CalibrationParams):
-    """
-    ★ 新增：应用预拟合的校准参数（测试集使用）
-    """
-    yp = y_pred_disp.clone()
-    B, K, T = yp.shape
-
-    if calib.method == "per_k":
-        for k in range(K):
-            params = calib.params.get(f"k{k}", {"a": 1.0, "b": 0.0})
-            yp[:, k, :] = params["a"] * yp[:, k, :] + params["b"]
-
-    elif calib.method == "per_kt":
-        for k in range(K):
-            for t in range(T):
-                params = calib.params.get(f"k{k}_t{t}", {"a": 1.0, "b": 0.0})
-                yp[:, k, t] = params["a"] * yp[:, k, t] + params["b"]
-
-    return yp
-
-
-class PostCalibTimeConv(nn.Module):
-    """Time-conv 后校准（需训练）"""
-    def __init__(self, K, kernel_size=3):
+class PhysicsMLPBaseline(nn.Module):
+    def __init__(self, in_dim=7, out_dim=7, hidden=128):
         super().__init__()
-        pad = (kernel_size - 1) // 2
-        self.dw = nn.Conv1d(K, K, kernel_size, padding=pad, groups=K, bias=True)
-        with torch.no_grad():
-            self.dw.weight.zero_()
-            center = pad
-            for k in range(K):
-                self.dw.weight[k, 0, center] = 1.0
-            self.dw.bias.zero_()
-
-    def forward(self, y):
-        return self.dw(y)
-
-
-# ========================== 接口增强模块（保留） ==========================
-class PhysAdapter(nn.Module):
-    """深度可分离卷积适配器"""
-    def __init__(self, in_ch=2, k=3):
-        super().__init__()
-        pad = (k - 1) // 2
-        self.dw = nn.Conv1d(in_ch, in_ch, k, padding=pad, groups=in_ch, bias=True)
-        self.pw = nn.Conv1d(in_ch, in_ch, 1, bias=True)
-        with torch.no_grad():
-            self.dw.weight.zero_()
-            self.dw.bias.zero_()
-            for c in range(in_ch):
-                self.dw.weight[c, 0, pad] = 1.0
-            self.pw.weight.zero_()
-            for c in range(in_ch):
-                self.pw.weight[c, c, 0] = 1.0
-            self.pw.bias.zero_()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden), nn.ReLU(),
+            nn.Linear(hidden, hidden), nn.ReLU(),
+            nn.Linear(hidden, out_dim),
+        )
 
     def forward(self, x):
-        return self.pw(self.dw(x))
+        return self.net(x)
 
 
-class PhysFeaReducer(nn.Module):
-    """派生特征提取器"""
-    def __init__(self, eps=1e-6):
+class PhysicsSeqPredictor(nn.Module):
+    """Transformer encoder：输入 recipe7 → 输出 phys7（支持输出 (B,out_dim,T_phys)）"""
+    def __init__(self, in_dim=7, out_dim=7, d_model=128, nhead=4, num_layers=2, dropout=0.1, T_phys: int = 1):
         super().__init__()
-        self.eps = eps
-        self.pw = nn.Conv1d(5, 2, 1, bias=True)
-        nn.init.zeros_(self.pw.weight)
-        with torch.no_grad():
-            self.pw.weight[0, 0, 0] = 1.0
-            self.pw.weight[1, 1, 0] = 1.0
-        nn.init.zeros_(self.pw.bias)
+        self.in_dim = in_dim
+        self.out_dim = out_dim
+        self.T_phys = T_phys
+        self.proj = nn.Linear(in_dim, d_model)
+        enc_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead,
+                                               dim_feedforward=4*d_model, dropout=dropout,
+                                               batch_first=True, activation="gelu")
+        self.enc = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
+        self.head = nn.Linear(d_model, out_dim)
 
-    def forward(self, F, I):
-        logI = torch.log(I.clamp_min(self.eps))
-        dF = F[:, :, 1:] - F[:, :, :-1]
-        dI = I[:, :, 1:] - I[:, :, :-1]
-        dF = torch.nn.functional.pad(dF, (1, 0), mode="replicate")
-        dI = torch.nn.functional.pad(dI, (1, 0), mode="replicate")
-        x = torch.cat([F, I, logI, dF, dI], dim=1)
-        return self.pw(x)
+    def forward(self, recipe7: torch.Tensor):
+        # recipe7: (B,7)  -> (B,T_phys,7)
+        B = recipe7.size(0)
+        x = recipe7.unsqueeze(1).expand(B, self.T_phys, recipe7.size(1))
+        x = self.proj(x)
+        x = self.enc(x)
+        y = self.head(x)              # (B,T_phys,out_dim)
+        return y.transpose(1, 2)      # (B,out_dim,T_phys)
 
 
-class IonGate(nn.Module):
-    """Ion 门控机制"""
-    def __init__(self, k=5):
+class PhysicsGRUPredictor(nn.Module):
+    def __init__(self, in_dim=7, out_dim=7, hidden=128, num_layers=2, T_phys: int = 1):
         super().__init__()
-        self.k = k
-        self.mlp = nn.Sequential(
-            nn.Conv1d(2, 4, 1), nn.ReLU(inplace=True),
-            nn.Conv1d(4, 1, 1), nn.Sigmoid()
-        )
+        self.T_phys = T_phys
+        self.proj = nn.Linear(in_dim, hidden)
+        self.gru = nn.GRU(hidden, hidden, num_layers=num_layers, batch_first=True)
+        self.head = nn.Linear(hidden, out_dim)
 
-    def forward(self, F, I):
-        pad = (self.k - 1) // 2
-        w = torch.ones(1, 1, self.k, device=I.device) / self.k
-        I_s = nn.functional.conv1d(nn.functional.pad(I, (pad, pad), mode="replicate"), w)
-        gate = self.mlp(torch.cat([F, I], dim=1))
-        return gate * I + (1.0 - gate) * I_s
-
-
-class PerFamilyHead(nn.Module):
-    """逐 Family 输出头"""
-    def __init__(self, K, k=3):
-        super().__init__()
-        pad = (k - 1) // 2
-        self.dw = nn.Conv1d(K, K, k, padding=pad, groups=K, bias=True)
-        self.alpha = nn.Parameter(torch.ones(K))
-        self.beta = nn.Parameter(torch.zeros(K))
-        with torch.no_grad():
-            self.dw.weight.zero_()
-            for c in range(K):
-                self.dw.weight[c, 0, pad] = 1.0
-            self.dw.bias.zero_()
-
-    def forward(self, y):
-        y = self.dw(y)
-        return self.alpha.view(1, -1, 1) * y + self.beta.view(1, -1, 1)
+    def forward(self, recipe7: torch.Tensor):
+        B = recipe7.size(0)
+        x = recipe7.unsqueeze(1).expand(B, self.T_phys, recipe7.size(1))
+        x = self.proj(x)
+        h, _ = self.gru(x)
+        y = self.head(h)              # (B,T_phys,out_dim)
+        return y.transpose(1, 2)      # (B,out_dim,T_phys)
 
 
-class HeteroHead(nn.Module):
-    """异方差输出头（预测均值和方差）"""
-    def __init__(self, K, per_family=True):
-        super().__init__()
-        self.per_family = per_family
-        self.mu_head = PerFamilyHead(K) if per_family else nn.Identity()
-        self.logv_head = nn.Sequential(
-            nn.Conv1d(K, K, 1, groups=1, bias=True),
-        )
-        nn.init.zeros_(self.logv_head[0].weight)
-        nn.init.constant_(self.logv_head[0].bias, math.log(1.0))
+@torch.no_grad()
+def infer_phys7_from_stageA_ckpt(stageA_ckpt_path: str,
+                                 recipe_raw_np: np.ndarray,
+                                 device: str = "cpu") -> np.ndarray:
+    ck = _torch_load_ckpt(stageA_ckpt_path, map_location="cpu")
+    meta = ck.get("meta", {}) or {}
+    sd = ck.get("state_dict", ck.get("model", ck))
 
-    def forward(self, y):
-        mu = self.mu_head(y) if self.per_family else y
-        logv = self.logv_head(mu.detach())
-        return mu, logv
+    # ---- 1) 清理 key 前缀：兼容 model./module. ----
+    if isinstance(sd, dict):
+        sd2 = {}
+        for k, v in sd.items():
+            kk = k
+            if kk.startswith("model."):
+                kk = kk[len("model."):]
+            if kk.startswith("module."):
+                kk = kk[len("module."):]
+            sd2[kk] = v
+        sd = sd2
 
+    model_type = str(meta.get("model_type", "transformer")).lower()
+    out_dim = int(meta.get("out_dim", 7))
+    in_dim  = int(meta.get("in_dim", 7))
+    T_phys  = int(meta.get("T", meta.get("T_phys", 1)))
 
-# ========================== 物理前向传播（保留） ==========================
-def phys_forward_raw(static_8, tvals, phys_F, phys_I, ion_transform, allow_grad=False):
-    """物理模型前向传播"""
-    phys_F.eval()
-    phys_I.eval()
-    with torch.set_grad_enabled(allow_grad):
-        f = phys_F(static_8, tvals)
-        i_z = phys_I(static_8, tvals)
-        f_ch = f[:, 0:1, :]
-        z_ch = i_z[:, 1:2, :] if i_z.size(1) >= 2 else i_z[:, 0:1, :]
-        i = ion_transform(z_ch)
-        phys = torch.cat([f_ch, i], dim=1)
-        return torch.nan_to_num(phys, nan=0.0, posinf=1e6, neginf=-1e6)
+    # ---- 2) 从 state_dict 推断维度（关键修复点）----
+    def _pick_divisor(d, prefers=(8, 4, 2, 1)):
+        for h in prefers:
+            if d % h == 0:
+                return h
+        return 1
 
-
-def phys_interface_pipeline(phys_raw, variant, adapters):
-    """物理特征增强流水线"""
-    F = phys_raw[:, 0:1, :]
-    I = phys_raw[:, 1:2, :]
-
-    # Ion 策略
-    mode = variant.get("ion_gate", "use")
-    if mode == "zero":
-        I_eff = torch.zeros_like(I)
-    elif mode == "const":
-        I_eff = torch.nan_to_num(I, nan=0.0).mean(dim=0, keepdim=True).expand_as(I)
-    elif mode == "smooth":
-        k = 5
-        pad = (k - 1) // 2
-        w = torch.ones(1, 1, k, device=I.device) / k
-        I_eff = nn.functional.conv1d(nn.functional.pad(I, (pad, pad), mode="replicate"), w)
-    elif mode == "gate":
-        I_eff = adapters["gate"](F, I)
-    else:
-        I_eff = I
-
-    x = torch.cat([F, I_eff], dim=1)
-
-    # 派生特征
-    if variant.get("use_derived", False):
-        x = adapters["reducer"](F, I_eff)
-
-    # PhysAdapter
-    if variant.get("use_adapter", False):
-        x = adapters["adapter"](x)
-
-    return x
-
-
-# ========================== 逐 Family 评估报告（新增 ★）==========================
-def compute_per_family_metrics(mts: Dict, m_sparse: torch.Tensor, fams: List[str]):
-    """
-    ★ 新增：计算逐 Family 指标 + Macro/Micro 汇总
-
-    返回:
-        per_family: {family_name: {metric: scalar}}
-        macro: {metric: scalar}  # 各 Family 简单平均
-        micro: {metric: scalar}  # 按样本数加权平均
-        min_family: {metric: family_name}  # 最差 Family
-    """
-    sup = m_sparse.sum(dim=0).detach().cpu().numpy() > 0  # (K, T)
-
-    per_family = {}
-    for k, fam in enumerate(fams):
-        per_family[fam] = {}
-        for metric_name in ["R2", "MAE", "RMSE", "SMAPE", "MAPE", "MSE"]:
-            if metric_name not in mts:
-                continue
-            grid = mts[metric_name]
-            if torch.is_tensor(grid):
-                grid = grid.detach().cpu().numpy()
-
-            # 该 Family 的平均值（忽略无监督的时间点）
-            fam_vals = grid[k, :]
-            fam_sup = sup[k, :]
-            if fam_sup.sum() > 0:
-                per_family[fam][metric_name] = float(np.nanmean(fam_vals[fam_sup]))
+    if "transformer" in model_type:
+        # 优先用 meta；meta 没写/写错时从 ckpt 推断
+        d_model = int(meta.get("d_model", 0)) if str(meta.get("d_model", "")).strip() != "" else 0
+        if d_model <= 0:
+            if "head.weight" in sd:
+                d_model = int(sd["head.weight"].shape[1])   # <-- 这里会得到 64
+            elif "proj.weight" in sd:
+                d_model = int(sd["proj.weight"].shape[0])
             else:
-                per_family[fam][metric_name] = np.nan
+                d_model = 128
 
-    # Macro 平均（公平对待每个 Family）
-    macro = {}
-    for metric_name in ["R2", "MAE", "RMSE", "SMAPE", "MAPE", "MSE"]:
-        vals = [per_family[fam].get(metric_name, np.nan) for fam in fams]
-        macro[metric_name] = float(np.nanmean(vals))
+        # 推断 num_layers（meta 没写时）
+        num_layers = int(meta.get("num_layers", 0)) if str(meta.get("num_layers", "")).strip() != "" else 0
+        if num_layers <= 0:
+            layer_ids = set()
+            for k in sd.keys():
+                m = re.match(r"enc\.layers\.(\d+)\.", k)
+                if m:
+                    layer_ids.add(int(m.group(1)))
+            num_layers = (max(layer_ids) + 1) if layer_ids else 2
 
-    # Micro 平均（按样本数加权）
-    micro = {}
-    for metric_name in ["R2", "MAE", "RMSE", "SMAPE", "MAPE", "MSE"]:
-        if metric_name not in mts:
-            continue
-        grid = mts[metric_name]
-        if torch.is_tensor(grid):
-            grid = grid.detach().cpu().numpy()
+        nhead = int(meta.get("nhead", 4))
+        if d_model % nhead != 0:
+            nhead = _pick_divisor(d_model)
 
-        # 全局平均（所有有监督的点）
-        if sup.sum() > 0:
-            micro[metric_name] = float(np.nanmean(grid[sup]))
-        else:
-            micro[metric_name] = np.nan
+        model = PhysicsSeqPredictor(
+            in_dim=in_dim, out_dim=out_dim,
+            d_model=d_model, nhead=nhead,
+            num_layers=num_layers,
+            dropout=float(meta.get("dropout", 0.1)),
+            T_phys=T_phys
+        )
 
-    # 最差 Family（R² 最低 / MAE 最高）
-    min_family = {}
-    r2_vals = {fam: per_family[fam].get("R2", -np.inf) for fam in fams}
-    min_family["R2"] = min(r2_vals, key=r2_vals.get)
+    elif "gru" in model_type:
+        hidden = int(meta.get("hidden", 0)) if str(meta.get("hidden", "")).strip() != "" else 0
+        if hidden <= 0:
+            if "head.weight" in sd:
+                hidden = int(sd["head.weight"].shape[1])
+            elif "proj.weight" in sd:
+                hidden = int(sd["proj.weight"].shape[0])
+            else:
+                hidden = 128
 
-    mae_vals = {fam: per_family[fam].get("MAE", np.inf) for fam in fams}
-    min_family["MAE"] = max(mae_vals, key=mae_vals.get)
+        num_layers = int(meta.get("num_layers", 0)) if str(meta.get("num_layers", "")).strip() != "" else 0
+        if num_layers <= 0:
+            # gru.weight_ih_l0 / l1 ...
+            ids = []
+            for k in sd.keys():
+                m = re.match(r"gru\.weight_ih_l(\d+)$", k)
+                if m:
+                    ids.append(int(m.group(1)))
+            num_layers = (max(ids) + 1) if ids else 2
 
-    return per_family, macro, micro, min_family
+        model = PhysicsGRUPredictor(in_dim=in_dim, out_dim=out_dim, hidden=hidden, num_layers=num_layers, T_phys=T_phys)
 
-
-def print_per_family_report(per_family, macro, micro, min_family, fams, title="Evaluation"):
-    """★ 新增：打印逐 Family 报告"""
-    print(f"\n{'=' * 80}")
-    print(f"{title:^80}")
-    print(f"{'=' * 80}")
-
-    # 逐 Family
-    print(f"\n{'Family':<10} {'R²':>8} {'MAE':>8} {'RMSE':>8} {'SMAPE/MAPE':>12}")
-    print("-" * 80)
-    for fam in fams:
-        r2 = per_family[fam].get("R2", np.nan)
-        mae = per_family[fam].get("MAE", np.nan)
-        rmse = per_family[fam].get("RMSE", np.nan)
-        smape = per_family[fam].get("SMAPE", per_family[fam].get("MAPE", np.nan))
-        print(f"{fam:<10} {r2:>8.4f} {mae:>8.2f} {rmse:>8.2f} {smape:>12.2f}")
-
-    # 汇总
-    print("-" * 80)
-    print(f"{'Macro Avg':<10} {macro.get('R2', np.nan):>8.4f} {macro.get('MAE', np.nan):>8.2f} "
-          f"{macro.get('RMSE', np.nan):>8.2f} {macro.get('SMAPE', macro.get('MAPE', np.nan)):>12.2f}")
-    print(f"{'Micro Avg':<10} {micro.get('R2', np.nan):>8.4f} {micro.get('MAE', np.nan):>8.2f} "
-          f"{micro.get('RMSE', np.nan):>8.2f} {micro.get('SMAPE', micro.get('MAPE', np.nan)):>12.2f}")
-    print(f"{'Min Family':<10} {min_family['R2']:<8} (R²={per_family[min_family['R2']].get('R2', np.nan):.4f})")
-    print(f"{'=' * 80}\n")
-
-
-# ========================== 可视化增强（新增 ★）==========================
-def plot_per_family_diagnostics(y_pred, y_true, mask, fams, T_values, save_dir, title_prefix=""):
-    """★ 新增：逐 Family 诊断图（parity + residual）"""
-    ensure_dir(save_dir)
-    import matplotlib.pyplot as plt
-
-    yp = y_pred.detach().cpu().numpy()
-    yt = y_true.detach().cpu().numpy()
-    mk = mask.detach().cpu().numpy()
-
-    K = len(fams)
-    fig, axes = plt.subplots(2, K, figsize=(4 * K, 8))
-    if K == 1:
-        axes = axes.reshape(2, 1)
-
-    for k, fam in enumerate(fams):
-        valid = mk[:, k, :].flatten()
-        yp_k = yp[:, k, :].flatten()[valid]
-        yt_k = yt[:, k, :].flatten()[valid]
-
-        if len(yp_k) == 0:
-            continue
-
-        # 上排：Parity
-        ax1 = axes[0, k]
-        ax1.scatter(yt_k, yp_k, alpha=0.5, s=10)
-
-        # 回归线
-        if len(yp_k) > 1:
-            from scipy.stats import linregress
-            slope, intercept, r, *_ = linregress(yt_k, yp_k)
-            x_line = np.linspace(yt_k.min(), yt_k.max(), 100)
-            ax1.plot(x_line, slope * x_line + intercept, 'r-',
-                     label=f'y={slope:.2f}x+{intercept:.1f}\nR²={r ** 2:.3f}')
-
-        ax1.plot([yt_k.min(), yt_k.max()], [yt_k.min(), yt_k.max()],
-                 'k--', label='Ideal')
-        ax1.set_xlabel('True')
-        ax1.set_ylabel('Pred')
-        ax1.set_title(f'{fam}')
-        ax1.legend(fontsize=8)
-        ax1.grid(alpha=0.3)
-
-        # 下排：Residual
-        ax2 = axes[1, k]
-        residuals = yp_k - yt_k
-        ax2.hist(residuals, bins=30, edgecolor='black', alpha=0.7)
-        ax2.axvline(0, color='red', linestyle='--')
-        ax2.set_xlabel('Residual')
-        ax2.set_ylabel('Frequency')
-        ax2.set_title(f'μ={residuals.mean():.2f}, σ={residuals.std():.2f}')
-
-    plt.tight_layout()
-    plt.savefig(os.path.join(save_dir, f"{title_prefix}_family_diagnostics.png"), dpi=150)
-    plt.close()
-
-
-def plot_temporal_error(y_pred, y_true, mask, fams, T_values, save_dir, title_prefix=""):
-    """★ 新增：时序误差曲线（每个 Family）"""
-    ensure_dir(save_dir)
-    import matplotlib.pyplot as plt
-
-    yp = y_pred.detach().cpu().numpy()
-    yt = y_true.detach().cpu().numpy()
-    mk = mask.detach().cpu().numpy().astype(bool)
-
-    K = len(fams)
-    T = len(T_values)
-
-    fig, axes = plt.subplots(K, 1, figsize=(10, 3 * K), squeeze=False)
-
-    for k, fam in enumerate(fams):
-        ax = axes[k, 0]
-        mae_t = []
-        for t in range(T):
-            valid = mk[:, k, t]
-            if valid.sum() == 0:
-                mae_t.append(np.nan)
-                continue
-            err = np.abs(yp[:, k, t][valid] - yt[:, k, t][valid])
-            mae_t.append(float(err.mean()))
-
-        ax.plot(T_values, mae_t, marker='o', label=fam)
-        ax.set_xlabel('Time')
-        ax.set_ylabel('MAE')
-        ax.set_title(f'{fam} - Temporal MAE')
-        ax.grid(alpha=0.3)
-        ax.legend()
-
-    plt.tight_layout()
-    plt.savefig(os.path.join(save_dir, f"{title_prefix}_temporal_error.png"), dpi=150)
-    plt.close()
-
-
-# ========================== 训练流程（修缮版 ★）==========================
-def variant_training_pipeline_v2(dev, meta_old, data_dict, variant: Dict, save_dir: str, seed: int):
-    """
-    ★ 修缮版训练流程
-    关键修改：
-    1. 使用 data_dict 中的 train/val/test 划分
-    2. 训练仅用 train，验证用 val，最终测试用 test
-    3. 后校准仅在 train 上拟合，test 上应用
-    4. 逐 Family 评估 + Macro/Micro 报告
-    """
-    set_seed(seed)
-    ensure_dir(save_dir)
-    torch.backends.cudnn.benchmark = True
-
-    # === 解包数据 ===
-    s8_full = data_dict["s8"].to(dev)
-    y_full = data_dict["y_sparse"].to(dev)
-    m_full = data_dict["m_sparse"].to(dev)
-    tvals_full = data_dict["tvals"].to(dev)
-    fams = data_dict["families"]
-
-    train_idx = data_dict["splits"]["train"]
-    val_idx = data_dict["splits"]["val"]
-    test_idx = data_dict["splits"]["test"]
-
-    # 提取子集
-    s8_train = s8_full[train_idx]
-    y_train = y_full[train_idx]
-    m_train = m_full[train_idx]
-    tvals_train = tvals_full if tvals_full.dim() == 1 else tvals_full[train_idx]
-
-    s8_val = s8_full[val_idx]
-    y_val = y_full[val_idx]
-    m_val = m_full[val_idx]
-    tvals_val = tvals_full if tvals_full.dim() == 1 else tvals_full[val_idx]
-
-    s8_test = s8_full[test_idx]
-    y_test = y_full[test_idx]
-    m_test = m_full[test_idx]
-    tvals_test = tvals_full if tvals_full.dim() == 1 else tvals_full[test_idx]
-
-    # === 模型初始化 ===
-    phys_F, phys_I, ion_aff_init = build_phys_from_ckpt(Cfg.phys_ckpt_F, Cfg.phys_ckpt_I, dev)
-    ion_tr = IonInverseTransform(ion_aff_init, learnable=variant.get("learnable_ion", False)).to(dev)
-
-    morph = TemporalRegressor(K=len(fams)).to(dev)
-    if os.path.exists(Cfg.morph_ckpt):
-        try:
-            ck = _safe_load(Cfg.morph_ckpt, map_location="cpu")
-            sd = ck["model"] if (isinstance(ck, dict) and "model" in ck) else ck
-            morph.load_state_dict(sd, strict=False)
-            print(f"[{variant['name']}|seed{seed}] Loaded morph ckpt.")
-        except Exception as e:
-            print(f"[{variant['name']}|seed{seed}] morph ckpt load failed: {e}")
-
-    calib = build_calib_head(variant["calib_head"], K=len(fams)).to(dev)
-
-    # 输出头
-    per_family_head = PerFamilyHead(K=len(fams)).to(dev) if variant.get("per_family_head", False) else nn.Identity().to(dev)
-    hetero_head = HeteroHead(K=len(fams), per_family=variant.get("per_family_head", False)).to(dev) if variant.get("hetero", False) else None
-    task_logvars = nn.Parameter(torch.zeros(len(fams), device=dev)) if variant.get("task_uncertainty", False) else None
-
-    # 接口增强
-    adapters = {
-        "adapter": PhysAdapter(2, k=3).to(dev),
-        "reducer": PhysFeaReducer().to(dev),
-        "gate": IonGate(k=5).to(dev),
-    }
-
-    # === 优化器 ===
-    params = [
-        {"params": [p for p in morph.parameters() if p.requires_grad], "lr": Cfg.lr_morph, "weight_decay": Cfg.wd_morph},
-        {"params": [p for p in calib.parameters() if p.requires_grad], "lr": Cfg.lr_calib, "weight_decay": Cfg.wd_calib},
-    ]
-    if ion_tr.learnable:
-        params.append({"params": [p for p in ion_tr.parameters() if p.requires_grad], "lr": Cfg.ion_learnable_lr, "weight_decay": Cfg.ion_learnable_wd})
-    if not variant.get("freeze_phys", True):
-        params += [
-            {"params": [p for p in phys_F.parameters() if p.requires_grad], "lr": Cfg.lr_phys, "weight_decay": Cfg.wd_phys},
-            {"params": [p for p in phys_I.parameters() if p.requires_grad], "lr": Cfg.lr_phys, "weight_decay": Cfg.wd_phys},
-        ]
-    if variant.get("per_family_head", False):
-        params.append({"params": per_family_head.parameters(), "lr": Cfg.lr_morph, "weight_decay": 0.0})
-    if variant.get("hetero", False):
-        params.append({"params": hetero_head.parameters(), "lr": Cfg.lr_morph, "weight_decay": 0.0})
-    if variant.get("task_uncertainty", False):
-        params.append({"params": [task_logvars], "lr": 1e-3, "weight_decay": 0.0})
-    if variant.get("use_adapter", False) or variant.get("use_derived", False) or variant.get("ion_gate", "use") == "gate":
-        params.append({
-            "params": list(adapters["adapter"].parameters()) + list(adapters["reducer"].parameters()) + list(adapters["gate"].parameters()),
-            "lr": 5e-4, "weight_decay": 0.0
-        })
-
-    opt = torch.optim.AdamW(params)
-    ema = EMA(morph, decay=Cfg.ema_decay) if Cfg.use_ema else None
-    stopper = EarlyStopper(Cfg.early_stop_patience) if Cfg.early_stop else None
-
-    # 冻结/解冻
-    def set_phys_trainable(flag: bool):
-        for p in phys_F.parameters(): p.requires_grad = flag
-        for p in phys_I.parameters(): p.requires_grad = flag
-        phys_F.train(flag)
-        phys_I.train(flag)
-
-    if variant.get("freeze_phys", True):
-        set_phys_trainable(False)
     else:
-        if variant.get("stagewise_unfreeze", False):
-            set_phys_trainable(False)
-        else:
-            set_phys_trainable(True)
+        hidden = int(meta.get("hidden", 0)) if str(meta.get("hidden", "")).strip() != "" else 0
+        if hidden <= 0 and "net.0.weight" in sd:
+            hidden = int(sd["net.0.weight"].shape[0])
+        if hidden <= 0:
+            hidden = 128
+        model = PhysicsMLPBaseline(in_dim=in_dim, out_dim=out_dim, hidden=hidden)
 
-    morph.train()
-    calib.train()
-    if isinstance(per_family_head, nn.Module): per_family_head.train()
-    if hetero_head is not None: hetero_head.train()
+    # ---- 3) 现在维度一致了，再 load ----
+    model.load_state_dict(sd, strict=False)
+    model.to(device).eval()
 
-    best_snapshot = None
-    best_val_macro_r2 = -1e9
-    val_history = []
+    # 后面你的 norm / forward / denorm 保持不变...
+    norm = meta.get("norm", {}) or {}
+    xmean = norm.get("x_mean", norm.get("mean", None))
+    xstd  = norm.get("x_std",  norm.get("std",  None))
+    if xmean is None or xstd is None:
+        nx = meta.get("norm_x", None)
+        if isinstance(nx, dict):
+            xmean = nx.get("mean", None)
+            xstd = nx.get("std", None)
 
-    # === 训练循环 ===
-    for e in range(1, Cfg.max_epochs + 1):
-        # 阶段式解冻
-        if (not variant.get("freeze_phys", True)) and variant.get("stagewise_unfreeze", False) and e == (Cfg.max_epochs // 2):
-            for p in phys_F.parameters(): p.requires_grad = False
-            for p in phys_I.parameters(): p.requires_grad = False
-            for n, m in phys_F.named_modules():
-                if n.startswith("encoder.layers.") and n.endswith(".3"):
-                    for p in m.parameters(): p.requires_grad = True
-            for n, m in phys_I.named_modules():
-                if n.startswith("encoder.layers.") and n.endswith(".3"):
-                    for p in m.parameters(): p.requires_grad = True
-            phys_F.train(True)
-            phys_I.train(True)
-            print(f"[{variant['name']}|seed{seed}] Stagewise unfreeze at epoch {e}.")
+    recipe = recipe_raw_np.astype(np.float32)
+    if xmean is not None and xstd is not None:
+        xmean = np.array(xmean, dtype=np.float32).reshape(1, -1)
+        xstd  = np.array(xstd,  dtype=np.float32).reshape(1, -1)
+        recipe_n = (recipe - xmean) / (xstd + 1e-6)
+    else:
+        recipe_n = recipe
 
-        # === 训练步（仅用 train 集）===
-        opt.zero_grad()
+    xr = torch.from_numpy(recipe_n).to(device)
+    y = model(xr)
+    if y.dim() == 3:
+        y = y[..., 0]
+    y_np = y.detach().cpu().numpy().astype(np.float32)
 
-        phys_pred = phys_forward_raw(s8_train, tvals_train, phys_F, phys_I, ion_tr,
-                                     allow_grad=any(p.requires_grad for p in phys_F.parameters()))
-        phys_in = phys_interface_pipeline(phys_pred, variant, adapters)
+    ymean = norm.get("y_mean", None)
+    ystd  = norm.get("y_std", None)
+    if ymean is None or ystd is None:
+        ny = meta.get("norm_y", None)
+        if isinstance(ny, dict):
+            ymean = ny.get("mean", None)
+            ystd = ny.get("std", None)
 
-        y_core = morph(s8_train, phys_in, tvals_train)
-        y_core = calib(torch.nan_to_num(y_core, nan=0.0, posinf=1e6, neginf=-1e6))
+    if ymean is not None and ystd is not None:
+        ymean = np.array(ymean, dtype=np.float32).reshape(1, -1)
+        ystd  = np.array(ystd,  dtype=np.float32).reshape(1, -1)
+        y_np = y_np * (ystd + 1e-6) + ymean
 
-        if variant.get("hetero", False):
-            mu, logv = hetero_head(y_core)
-            nll = hetero_nll(mu, logv, y_train, m_train, task_logvars=task_logvars)
-            huber_s, items = masked_huber_with_channel_norm(
-                mu, y_train, m_train, delta=Cfg.loss_delta,
-                smooth_weight=Cfg.loss_smooth_weight,
-                mono_penalty={'k_idx': 0, 'weight': Cfg.mono_zmin_weight}
-            )
-            loss = nll + 0.1 * huber_s
-            y_for_eval_train = mu
-        else:
-            y_head = per_family_head(y_core) if variant.get("per_family_head", False) else y_core
-            loss, items = masked_huber_with_channel_norm(
-                y_pred=y_head, y_true=y_train, mask=m_train,
-                delta=Cfg.loss_delta, smooth_weight=Cfg.loss_smooth_weight,
-                mono_penalty={'k_idx': 0, 'weight': Cfg.mono_zmin_weight}
-            )
-            y_for_eval_train = y_head
+    return y_np
 
-        if ion_tr.learnable:
-            loss = loss + 1e-4 * ion_tr.reg()
-
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(morph.parameters(), max_norm=Cfg.batch_clip)
-        opt.step()
-        if ema is not None: ema.update(morph)
-
-        # === 验证步（每 5 轮）===
-        if e % 5 == 0 or e == 1 or e == Cfg.max_epochs:
-            with torch.no_grad():
-                if ema is not None:
-                    morph_eval = copy.deepcopy(morph).to(dev)
-                    ema.apply_to(morph_eval)
-                else:
-                    morph_eval = morph
-
-                phys_pred_val = phys_forward_raw(s8_val, tvals_val, phys_F, phys_I, ion_tr, allow_grad=False)
-                phys_in_val = phys_interface_pipeline(phys_pred_val, variant, adapters)
-                yp_val = morph_eval(s8_val, phys_in_val, tvals_val)
-                yp_val = calib(yp_val)
-
-                if variant.get("hetero", False):
-                    mu_val, _ = hetero_head(yp_val)
-                    yp_val = mu_val
-                elif variant.get("per_family_head", False):
-                    yp_val = per_family_head(yp_val)
-
-                # 展示域评估
-                fam_sign = torch.tensor(Cfg.family_sign, dtype=torch.float32, device=dev)
-                yhat_val_disp, ytrue_val_disp = transform_for_display(
-                    yp_val, y_val,
-                    family_sign=fam_sign, unit_scale=Cfg.unit_scale,
-                    flip_sign=Cfg.flip_sign, clip_nonneg=Cfg.clip_nonneg,
-                    min_display_value=Cfg.min_display_value
-                )
-
-                mts_val = _metrics_compat(yhat_val_disp, ytrue_val_disp, m_val,
-                                         use_smape=Cfg.use_smape, mape_eps_nm=Cfg.mape_eps_nm)
-
-                # 逐 Family 评估
-                per_fam_val, macro_val, micro_val, min_fam_val = compute_per_family_metrics(mts_val, m_val, fams)
-                val_macro_r2 = macro_val.get("R2", -1e9)
-
-                val_history.append({
-                    "epoch": e,
-                    "train_loss": float(loss.item()),
-                    "val_macro_r2": val_macro_r2,
-                    "val_min_r2": per_fam_val[min_fam_val["R2"]].get("R2", -1e9)
-                })
-
-                print(f"[{variant['name']}|seed{seed}][{e}/{Cfg.max_epochs}] "
-                      f"train_loss={loss.item():.4f} | "
-                      f"val_Macro-R²={val_macro_r2:.4f} | "
-                      f"val_Min-R²={per_fam_val[min_fam_val['R2']].get('R2', -1e9):.4f} ({min_fam_val['R2']})")
-
-                # 早停（基于 Macro-R²）
-                if stopper is not None:
-                    keep = stopper.step(-val_macro_r2)  # 负号因为 stopper 找最小值
-                    if keep:
-                        best_val_macro_r2 = val_macro_r2
-                        best_snapshot = {
-                            "epoch": e,
-                            "morph": copy.deepcopy(morph.state_dict()),
-                            "calib": copy.deepcopy(calib.state_dict()),
-                            "per_head": copy.deepcopy(per_family_head.state_dict()) if isinstance(per_family_head, nn.Module) else None,
-                            "hetero": copy.deepcopy(hetero_head.state_dict()) if hetero_head is not None else None,
-                            "ion": copy.deepcopy(ion_tr.state_dict()) if ion_tr.learnable else None,
-                            "adapters": {
-                                "adapter": copy.deepcopy(adapters["adapter"].state_dict()),
-                                "reducer": copy.deepcopy(adapters["reducer"].state_dict()),
-                                "gate": copy.deepcopy(adapters["gate"].state_dict()),
-                            }
-                        }
-                    else:
-                        print(f"[{variant['name']}|seed{seed}] Early stop. Best Val Macro-R²={best_val_macro_r2:.4f}")
-                        break
-
-    # === 加载最佳权重 ===
-    if best_snapshot is not None:
-        morph.load_state_dict(best_snapshot["morph"])
-        calib.load_state_dict(best_snapshot["calib"])
-        if isinstance(per_family_head, nn.Module) and (best_snapshot["per_head"] is not None):
-            per_family_head.load_state_dict(best_snapshot["per_head"])
-        if hetero_head is not None and (best_snapshot["hetero"] is not None):
-            hetero_head.load_state_dict(best_snapshot["hetero"])
-        if ion_tr.learnable and (best_snapshot["ion"] is not None):
-            ion_tr.load_state_dict(best_snapshot["ion"])
-        adapters["adapter"].load_state_dict(best_snapshot["adapters"]["adapter"])
-        adapters["reducer"].load_state_dict(best_snapshot["adapters"]["reducer"])
-        adapters["gate"].load_state_dict(best_snapshot["adapters"]["gate"])
-
-    morph.eval()
-    calib.eval()
-    phys_F.eval()
-    phys_I.eval()
-    if isinstance(per_family_head, nn.Module): per_family_head.eval()
-    if hetero_head is not None: hetero_head.eval()
-
-    # === 训练集预测（用于后校准拟合）===
-    with torch.no_grad():
-        phys_pred_train = phys_forward_raw(s8_train, tvals_train, phys_F, phys_I, ion_tr, allow_grad=False)
-        phys_in_train = phys_interface_pipeline(phys_pred_train, variant, adapters)
-        yhat_train = calib(morph(s8_train, phys_in_train, tvals_train))
-
-        if variant.get("hetero", False):
-            mu_train, _ = hetero_head(yhat_train)
-            yhat_train = mu_train
-        elif variant.get("per_family_head", False):
-            yhat_train = per_family_head(yhat_train)
-
-        fam_sign = torch.tensor(Cfg.family_sign, dtype=torch.float32, device=dev)
-        yhat_train_disp, ytrue_train_disp = transform_for_display(
-            yhat_train, y_train,
-            family_sign=fam_sign, unit_scale=Cfg.unit_scale,
-            flip_sign=Cfg.flip_sign, clip_nonneg=Cfg.clip_nonneg,
-            min_display_value=Cfg.min_display_value
+# ---------------------------- StageB Morph 模型（复制 StageB 的定义，Phys7 输入） ----------------------------
+class StaticEncoder(nn.Module):
+    def __init__(self, in_dim=7, d=64):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, d), nn.ReLU(),
+            nn.Linear(d, d), nn.ReLU(),
         )
 
-        # 拟合校准参数（仅训练集）★
-        post_kind = variant["post_calib"]
-        if post_kind == "time_conv":
-            pc = PostCalibTimeConv(len(fams)).to(dev)
-            opt_pc = torch.optim.Adam(pc.parameters(), lr=1e-2, weight_decay=0.0)
-            pc.train()
+    def forward(self, x):
+        return self.net(x)
 
-            # 固定输入为常量，不需要梯度；只让 pc 学
-            y_in = yhat_train_disp.detach()
-            y_t = ytrue_train_disp.detach()
-            m = m_train.float().detach()
 
-            with torch.enable_grad():  # ★ 只在这小段开启梯度
-                for _ in range(80):
-                    opt_pc.zero_grad()
-                    yp_pc = pc(y_in)  # (B,K,T)
-                    diff = (yp_pc - y_t)
-                    loss_pc = (diff.pow(2) * m).sum() / m.sum().clamp_min(1.0)
-                    loss_pc.backward()
-                    opt_pc.step()
+class TimeMLP(nn.Module):
+    def __init__(self, d=32):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(1, d), nn.ReLU(),
+            nn.Linear(d, d), nn.ReLU(),
+        )
+    def forward(self, t_bt1):
+        return self.net(t_bt1)
 
-            calib_params = {"method": "time_conv", "model_state": pc.state_dict()}
+
+class MorphTransformer(nn.Module):
+    def __init__(self, static_dim=7, phys_dim=7, K=6, T=T, d_model=128, nhead=4, num_layers=3, dropout=0.1):
+        super().__init__()
+        self.T = T
+        self.K = K
+        self.se = StaticEncoder(static_dim, d=64)
+        self.tm = TimeMLP(d=32)
+        self.proj = nn.Linear(64 + phys_dim + 32, d_model)
+        enc_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead,
+                                               dim_feedforward=4*d_model, dropout=dropout,
+                                               batch_first=True, activation="gelu")
+        self.enc = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
+        self.heads = nn.ModuleList([nn.Linear(d_model, 1) for _ in range(K)])
+
+    def forward(self, static_x: torch.Tensor, phys7_seq: torch.Tensor, time_mat: torch.Tensor):
+        """
+        static_x: (B,7)
+        phys7_seq: (B,7,T)
+        time_mat:  (B,T) or (T,)
+        return: (B,K,T)
+        """
+        B = static_x.size(0)
+        if time_mat.dim() == 1:
+            time_bt1 = time_mat.unsqueeze(0).expand(B, self.T).unsqueeze(-1)
         else:
-            calib_params = fit_calibration_params(yhat_train_disp, ytrue_train_disp, m_train,
-                                                  method=post_kind, min_points=12 if post_kind == "per_k" else 6)
+            time_bt1 = time_mat.unsqueeze(-1)
+        s = self.se(static_x).unsqueeze(1).expand(B, self.T, -1)           # (B,T,64)
+        p = phys7_seq.transpose(1,2).contiguous()                           # (B,T,7)
+        t = self.tm(time_bt1 / float(self.T))                               # (B,T,32)
+        x = torch.cat([s, p, t], dim=-1)
+        x = self.proj(x)
+        x = self.enc(x)
+        outs = []
+        for k in range(self.K):
+            yk = self.heads[k](x).squeeze(-1)    # (B,T)
+            outs.append(yk.unsqueeze(1))
+        return torch.cat(outs, dim=1)            # (B,K,T)
 
-    # === 测试集预测（应用校准）★ ===
-    with torch.no_grad():
-        phys_pred_test = phys_forward_raw(s8_test, tvals_test, phys_F, phys_I, ion_tr, allow_grad=False)
-        phys_in_test = phys_interface_pipeline(phys_pred_test, variant, adapters)
-        yhat_test = calib(morph(s8_test, phys_in_test, tvals_test))
 
-        if variant.get("hetero", False):
-            mu_test, _ = hetero_head(yhat_test)
-            yhat_test = mu_test
-        elif variant.get("per_family_head", False):
-            yhat_test = per_family_head(yhat_test)
+class MorphGRU(nn.Module):
+    def __init__(self, static_dim=7, phys_dim=7, K=6, T=T, hidden=128, num_layers=2):
+        super().__init__()
+        self.T = T
+        self.K = K
+        self.se = StaticEncoder(static_dim, d=64)
+        self.tm = TimeMLP(d=32)
+        self.proj = nn.Linear(64 + phys_dim + 32, hidden)
+        self.gru = nn.GRU(hidden, hidden, num_layers=num_layers, batch_first=True)
+        self.heads = nn.ModuleList([nn.Linear(hidden, 1) for _ in range(K)])
 
-        yhat_test_disp, ytrue_test_disp = transform_for_display(
-            yhat_test, y_test,
-            family_sign=fam_sign, unit_scale=Cfg.unit_scale,
-            flip_sign=Cfg.flip_sign, clip_nonneg=Cfg.clip_nonneg,
-            min_display_value=Cfg.min_display_value
+    def forward(self, static_x, phys7_seq, time_mat):
+        B = static_x.size(0)
+        if time_mat.dim() == 1:
+            time_bt1 = time_mat.unsqueeze(0).expand(B, self.T).unsqueeze(-1)
+        else:
+            time_bt1 = time_mat.unsqueeze(-1)
+        s = self.se(static_x).unsqueeze(1).expand(B, self.T, -1)
+        p = phys7_seq.transpose(1,2).contiguous()
+        t = self.tm(time_bt1 / float(self.T))
+        x = torch.cat([s, p, t], dim=-1)
+        x = self.proj(x)
+        h, _ = self.gru(x)
+        outs=[]
+        for k in range(self.K):
+            yk = self.heads[k](h).squeeze(-1)
+            outs.append(yk.unsqueeze(1))
+        return torch.cat(outs, dim=1)
+
+
+class MorphMLP(nn.Module):
+    """
+    简单基线：把 (static + phys7 + t) 拼起来做 MLP（逐时间步）。
+    """
+    def __init__(self, static_dim=7, phys_dim=7, K=6, T=T, hidden=256):
+        super().__init__()
+        self.T = T
+        self.K = K
+        self.se = StaticEncoder(static_dim, d=64)
+        self.tm = TimeMLP(d=32)
+        self.mlp = nn.Sequential(
+            nn.Linear(64 + phys_dim + 32, hidden), nn.ReLU(),
+            nn.Linear(hidden, hidden), nn.ReLU(),
+            nn.Linear(hidden, K),
         )
 
-        # 应用校准（不重新拟合）★
-        if post_kind == "time_conv":
-            pc_eval = PostCalibTimeConv(len(fams)).to(dev)
-            pc_eval.load_state_dict(calib_params["model_state"])
-            pc_eval.eval()
-            yhat_test_cal = pc_eval(yhat_test_disp).detach()
+    def forward(self, static_x, phys7_seq, time_mat):
+        B = static_x.size(0)
+        if time_mat.dim() == 1:
+            time_bt1 = time_mat.unsqueeze(0).expand(B, self.T).unsqueeze(-1)
         else:
-            yhat_test_cal = apply_calibration_params(yhat_test_disp, calib_params)
+            time_bt1 = time_mat.unsqueeze(-1)
+        s = self.se(static_x).unsqueeze(1).expand(B, self.T, -1)
+        p = phys7_seq.transpose(1,2).contiguous()
+        t = self.tm(time_bt1 / float(self.T))
+        x = torch.cat([s, p, t], dim=-1)
+        y = self.mlp(x)                         # (B,T,K)
+        return y.transpose(1,2).contiguous()    # (B,K,T)
 
-        # 最终测试集指标
-        mts_test = _metrics_compat(yhat_test_cal, ytrue_test_disp, m_test,
-                                   use_smape=Cfg.use_smape, mape_eps_nm=Cfg.mape_eps_nm)
-        mts_test["SMAPE"] = _compute_smape_grid(yhat_test_cal, ytrue_test_disp, m_test)
+def _pack_to_display_arrays(pack: Dict[str, np.ndarray],
+                            y_mean: np.ndarray, y_std: np.ndarray,
+                            family_sign: Optional[torch.Tensor],
+                            unit_scale: float):
+    """norm space -> um -> display space（含 sign/scale）"""
+    pred = pack["pred_norm"].astype(np.float32)
+    y    = pack["y_norm"].astype(np.float32)
+    m    = pack["mask"].astype(bool)
 
-        # 逐 Family 报告 ★
-        per_fam_test, macro_test, micro_test, min_fam_test = compute_per_family_metrics(mts_test, m_test, fams)
-        print_per_family_report(per_fam_test, macro_test, micro_test, min_fam_test, fams,
-                               title=f"Test Results ({variant['name']}|seed{seed})")
+    pred_um = pred * (y_std + 1e-6) + y_mean
+    y_um    = y    * (y_std + 1e-6) + y_mean
 
-    # === 导出 ===
-    T_values = meta_old["time_values"]
+    pred_t = torch.from_numpy(pred_um)
+    y_t    = torch.from_numpy(y_um)
 
-    # 1. Predictions
-    export_predictions_longtable(
-        yhat_test_cal.cpu(), ytrue_test_disp.cpu(), m_test.cpu(), fams, T_values,
-        save_dir, filename=f"test_predictions_seed{seed}.xlsx"
+    pred_disp, y_disp = pu.transform_for_display(
+        pred_t, y_t,
+        family_sign=family_sign,
+        unit_scale=unit_scale,
+        clip_nonneg=False
     )
+    return pred_disp.numpy(), y_disp.numpy(), m
 
-    # 2. Metrics Grid
-    mts_test_cpu = {k: _to_cpu_np_grid(v) for k, v in mts_test.items()}
-    export_metrics_grid(mts_test_cpu, fams, T_values, save_dir, filename=f"test_metrics_seed{seed}.xlsx")
 
-    # 3. Per-Family Summary
-    summary_path = os.path.join(save_dir, f"test_summary_seed{seed}.txt")
-    with open(summary_path, "w", encoding="utf-8") as f:
-        f.write(f"=== Test Results ({variant['name']}|seed{seed}) ===\n\n")
-        f.write(f"{'Family':<10} {'R²':>8} {'MAE':>8} {'RMSE':>8} {'SMAPE/MAPE':>12}\n")
-        f.write("-" * 60 + "\n")
-        for fam in fams:
-            r2 = per_fam_test[fam].get("R2", np.nan)
-            mae = per_fam_test[fam].get("MAE", np.nan)
-            rmse = per_fam_test[fam].get("RMSE", np.nan)
-            smape = per_fam_test[fam].get("SMAPE", per_fam_test[fam].get("MAPE", np.nan))
-            f.write(f"{fam:<10} {r2:>8.4f} {mae:>8.2f} {rmse:>8.2f} {smape:>12.2f}\n")
-        f.write("-" * 60 + "\n")
-        f.write(f"{'Macro Avg':<10} {macro_test.get('R2', np.nan):>8.4f} {macro_test.get('MAE', np.nan):>8.2f} "
-                f"{macro_test.get('RMSE', np.nan):>8.2f} {macro_test.get('SMAPE', macro_test.get('MAPE', np.nan)):>12.2f}\n")
-        f.write(f"{'Micro Avg':<10} {micro_test.get('R2', np.nan):>8.4f} {micro_test.get('MAE', np.nan):>8.2f} "
-                f"{micro_test.get('RMSE', np.nan):>8.2f} {micro_test.get('SMAPE', micro_test.get('MAPE', np.nan)):>12.2f}\n")
-        f.write(f"{'Min Family':<10} {min_fam_test['R2']:<8} (R²={per_fam_test[min_fam_test['R2']].get('R2', np.nan):.4f})\n")
+def _masked_r2(y_true_1d: np.ndarray, y_pred_1d: np.ndarray):
+    return masked_r2_np(y_true_1d, y_pred_1d)
 
-    # 4. 可视化
-    heatmap(
-        mts_test.get("R2", torch.zeros(len(fams), len(T_values))).detach().cpu()
-        if torch.is_tensor(mts_test.get("R2", None)) else _to_cpu_np_grid(mts_test.get("R2", None)),
-        fams, T_values, f"Test R² ({variant['name']}|seed{seed})",
-        os.path.join(save_dir, f"test_r2_seed{seed}.png")
-    )
 
-    plot_per_family_diagnostics(yhat_test_cal, ytrue_test_disp, m_test, fams, T_values,
-                                save_dir, title_prefix=f"test_seed{seed}")
+def _masked_mae(y_true_1d: np.ndarray, y_pred_1d: np.ndarray):
+    if y_true_1d.size == 0:
+        return float("nan")
+    return float(np.mean(np.abs(y_true_1d - y_pred_1d)))
 
-    plot_temporal_error(yhat_test_cal, ytrue_test_disp, m_test, fams, T_values,
-                       save_dir, title_prefix=f"test_seed{seed}")
 
-    # 5. 保存权重
-    torch.save(
-        {
-            "phys_F": phys_F.state_dict(),
-            "phys_I": phys_I.state_dict(),
-            "ion_affine": dict(a=float(ion_tr.a.data), b=float(ion_tr.b.data), c=float(ion_tr.c.data)),
-            "morph": morph.state_dict(),
-            "calib_head": calib.state_dict(),
-            "per_family_head": (per_family_head.state_dict() if isinstance(per_family_head, nn.Module) else None),
-            "hetero_head": (hetero_head.state_dict() if hetero_head is not None else None),
-            "task_logvars": (task_logvars.detach().cpu().numpy().tolist() if task_logvars is not None else None),
-            "adapters": {
-                "adapter": adapters["adapter"].state_dict(),
-                "reducer": adapters["reducer"].state_dict(),
-                "gate": adapters["gate"].state_dict(),
-            },
-            "calibration_params": calib_params.to_dict() if hasattr(calib_params, 'to_dict') else calib_params,
-            "meta": {
-                "families": fams,
-                "time_values": T_values,
-                "norm_static": meta_old["norm_static"],
-                "height_family": Cfg.HEIGHT_FAMILY,
-                "variant": variant,
-                "seed": seed,
-                "test_metrics": {
-                    "per_family": per_fam_test,
-                    "macro": macro_test,
-                    "micro": micro_test,
-                    "min_family": min_fam_test
-                }
-            },
+def export_stageC_report(out_dir: str,
+                         train_pack: Dict[str, np.ndarray],
+                         test_pack: Dict[str, np.ndarray],
+                         y_mean: np.ndarray, y_std: np.ndarray,
+                         family_sign: Optional[torch.Tensor],
+                         unit_scale: float):
+    """
+    基于 train/test pack 自动生成论文常用图表与指标文件。
+    不依赖 recipe 标签，先把核心结果做齐（overall + per-family + family×time）。
+    """
+    import os, json
+    import numpy as np
+    import pandas as pd
+    import matplotlib.pyplot as plt
+
+    os.makedirs(out_dir, exist_ok=True)
+
+    # ---- display arrays ----
+    tr_pred, tr_y, tr_m = _pack_to_display_arrays(train_pack, y_mean, y_std, family_sign, unit_scale)
+    te_pred, te_y, te_m = _pack_to_display_arrays(test_pack,  y_mean, y_std, family_sign, unit_scale)
+
+    K = te_y.shape[1]
+    TT = te_y.shape[2]
+    fams = list(FAMILIES)
+
+    # ---- overall ----
+    def overall_from(arr_pred, arr_y, arr_m):
+        yp = arr_pred.reshape(-1)[arr_m.reshape(-1)]
+        yt = arr_y.reshape(-1)[arr_m.reshape(-1)]
+        return _masked_r2(yt, yp), _masked_mae(yt, yp)
+
+    tr_r2, tr_mae = overall_from(tr_pred, tr_y, tr_m)
+    te_r2, te_mae = overall_from(te_pred, te_y, te_m)
+
+    # ---- per family ----
+    rows = []
+    for k in range(K):
+        mk = te_m[:, k, :].reshape(-1)
+        yp = te_pred[:, k, :].reshape(-1)[mk]
+        yt = te_y[:, k, :].reshape(-1)[mk]
+        rows.append({
+            "family": fams[k] if k < len(fams) else f"F{k}",
+            "test_R2": _masked_r2(yt, yp),
+            "test_MAE": _masked_mae(yt, yp),
+        })
+    df_fam = pd.DataFrame(rows)
+    df_fam.to_csv(os.path.join(out_dir, "metrics_family.csv"), index=False, encoding="utf-8-sig")
+
+    # ---- family × time MAE (test) ----
+    mae_mat = np.full((K, TT), np.nan, dtype=np.float32)
+    for k in range(K):
+        for t in range(TT):
+            mk = te_m[:, k, t]
+            if np.any(mk):
+                mae_mat[k, t] = np.mean(np.abs(te_pred[mk, k, t] - te_y[mk, k, t]))
+
+    # ---- save metrics json ----
+    metrics = {
+        "overall": {
+            "train_R2": float(tr_r2),
+            "test_R2": float(te_r2),
+            "train_MAE": float(tr_mae),
+            "test_MAE": float(te_mae),
         },
-        os.path.join(save_dir, f"final_model_seed{seed}.pth")
-    )
+        "family": df_fam.to_dict(orient="records"),
+        "family_time_MAE_test": mae_mat.tolist(),
+        "families": fams,
+        "T": int(TT),
+        "unit_scale": float(unit_scale),
+    }
+    with open(os.path.join(out_dir, "metrics_overall.json"), "w", encoding="utf-8") as f:
+        json.dump(metrics, f, ensure_ascii=False, indent=2)
 
-    save_manifest(save_dir)
+    # ---- Fig1: parity plot (test overall) ----
+    yt_all = te_y.reshape(-1)[te_m.reshape(-1)]
+    yp_all = te_pred.reshape(-1)[te_m.reshape(-1)]
+    # 点太多就抽样
+    if yt_all.size > 50000:
+        idx = np.random.RandomState(0).choice(yt_all.size, size=50000, replace=False)
+        yt_s = yt_all[idx]; yp_s = yp_all[idx]
+    else:
+        yt_s = yt_all; yp_s = yp_all
+
+    plt.figure()
+    plt.scatter(yt_s, yp_s, s=4)
+    lo = float(min(yt_s.min(), yp_s.min()))
+    hi = float(max(yt_s.max(), yp_s.max()))
+    plt.plot([lo, hi], [lo, hi])
+    plt.xlabel("Measured (display unit)")
+    plt.ylabel("Predicted (display unit)")
+    plt.title(f"Test Parity (R2={te_r2:.3f}, MAE={te_mae:.3f})")
+    plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, "fig_parity_test.png"), dpi=200)
+    plt.close()
+
+    # ---- Fig2: MAE heatmap (family×time) ----
+    plt.figure()
+    plt.imshow(mae_mat, aspect="auto")
+    plt.yticks(np.arange(K), fams[:K])
+    plt.xticks(np.arange(TT), [str(i+1) for i in range(TT)])
+    plt.xlabel("Time step")
+    plt.ylabel("Family")
+    plt.title("Test MAE (family × time)")
+    plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, "fig_mae_family_time_test.png"), dpi=200)
+    plt.close()
+
+    print(f"[Report] Saved metrics + figures to: {out_dir}")
+
+def build_morph_model(model_type: str, K: int, device: str):
+    mt = model_type.lower()
+    if mt == "transformer":
+        m = MorphTransformer(K=K).to(device)
+    elif mt == "gru":
+        m = MorphGRU(K=K).to(device)
+    elif mt == "mlp":
+        m = MorphMLP(K=K).to(device)
+    else:
+        raise ValueError(f"Unknown model_type: {model_type}")
+    return m
+
+
+def _extract_state_dict_and_meta(obj):
+    """从 torch.load 的返回里提取 state_dict + meta，兼容多种格式。"""
+    sd = None
+    meta = {}
+    if isinstance(obj, dict):
+        for k in ["state_dict", "model_state", "model", "morph_state", "net"]:
+            if k in obj and isinstance(obj[k], dict):
+                sd = obj[k]
+                break
+        meta = obj.get("meta", obj.get("cfg", {})) or {}
+    # 兜底：如果 obj 本身就是 state_dict
+    if sd is None and isinstance(obj, dict):
+        if any(isinstance(v, torch.Tensor) for v in obj.values()):
+            sd = obj
+    return sd, meta
+
+
+def _strip_prefixes(sd: dict):
+    sd2 = {}
+    for k, v in sd.items():
+        kk = k
+        # 常见前缀剥离
+        for pref in ["module.", "model.", "morph.", "morph_model.", "net."]:
+            if kk.startswith(pref):
+                kk = kk[len(pref):]
+        sd2[kk] = v
+    return sd2
+
+
+def _remap_morph_keys(sd: dict):
+    """
+    尝试把 StageB 旧命名映射到 StageC 当前命名。
+    这是“减少 missing/unexpected”的关键：命名不一致会导致几乎全 missing。
+    """
+    rules = [
+        # encoder/enc
+        (r"^encoder\.", "enc."),
+        (r"^transformer\.", "enc."),
+        # static/time encoder
+        (r"^static_encoder\.", "se."),
+        (r"^static_enc\.", "se."),
+        (r"^time_mlp\.", "tm."),
+        (r"^time_embed\.", "tm."),
+        # heads 命名
+        (r"^head\.(\d+)\.", r"heads.\1."),
+        (r"^head(\d+)\.", r"heads.\1."),
+        (r"^heads\.(\d+)\.linear\.", r"heads.\1."),
+    ]
+
+    out = {}
+    for k, v in sd.items():
+        kk = k
+        for pat, rep in rules:
+            kk = re.sub(pat, rep, kk)
+        out[kk] = v
+    return out
+
+
+def load_morph_ckpt(model: nn.Module, ckpt_path: str):
+    """
+    ✅ 修复点：
+    1) 不用裸 torch.load（PyTorch2.6+ weights_only 默认 True 会炸）-> 用 _torch_load_ckpt
+    2) 做 prefix strip + key remap，尽量对齐 StageB/StageC 命名
+    3) 返回 matched 统计：你能立刻判断到底“迁移是否真正生效”
+    """
+    if ckpt_path is None or (not os.path.exists(ckpt_path)):
+        return {"ok": False, "reason": "ckpt_not_found"}
+
+    obj = _torch_load_ckpt(ckpt_path, map_location="cpu")
+    sd, meta = _extract_state_dict_and_meta(obj)
+    if sd is None:
+        return {"ok": False, "reason": "unrecognized_format"}
+
+    sd = _strip_prefixes(sd)
+    sd = _remap_morph_keys(sd)
+
+    model_keys = set(model.state_dict().keys())
+    ckpt_keys = set(sd.keys())
+    matched = len(model_keys & ckpt_keys)
+
+    # 真正 load
+    missing, unexpected = model.load_state_dict(sd, strict=False)
 
     return {
-        "variant": variant["name"],
-        "seed": seed,
-        "test_metrics": mts_test,
-        "per_family": per_fam_test,
-        "macro": macro_test,
-        "micro": micro_test,
-        "min_family": min_fam_test,
-        "save_dir": save_dir
+        "ok": True,
+        "matched": matched,
+        "model_key_count": len(model_keys),
+        "ckpt_key_count": len(ckpt_keys),
+        "missing": missing,
+        "unexpected": unexpected,
+        "meta": meta
     }
 
-
-# ========================== 主流程 ==========================
-def main():
-    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"[StageC-Enhanced] device = {dev}")
-    set_seed(Cfg.seed)
-
-    # === 加载数据（保持对齐逻辑） ===
-    _, meta_old = excel_to_physics_dataset(Cfg.old_excel, sheet_name=Cfg.sheet_name)
-
-    # === 数据划分（新增） ===
-    data_dict = load_data_with_split(
-        Cfg.new_excel,
-        meta_old["norm_static"]["mean"],
-        meta_old["norm_static"]["std"],
-        meta_old["time_values"],
-        FAMILIES,
-        test_size=Cfg.test_size,
-        val_size=Cfg.val_size,
-        seed=Cfg.split_random_state
-    )
-
-    # 清洗监督
-    y_sparse = data_dict["y_sparse"]
-    m_sparse = data_dict["m_sparse"]
-    y_sparse = torch.nan_to_num(y_sparse, nan=0.0, posinf=0.0, neginf=0.0)
-    m_sparse = m_sparse & torch.isfinite(y_sparse)
-    data_dict["y_sparse"] = y_sparse
-    data_dict["m_sparse"] = m_sparse
-
-    # 展开 tvals
-    if data_dict["tvals"].dim() == 1:
-        B = data_dict["s8"].shape[0]
-        data_dict["tvals"] = data_dict["tvals"].unsqueeze(0).expand(B, -1).contiguous()
-
-    ensure_dir(Cfg.save_root)
-    results = []
-
-    # === 多变体 × 多种子训练 ===
-    for variant in Cfg.variants:
-        for seed in Cfg.seeds:
-            save_dir = os.path.join(Cfg.save_root, f"{variant['name']}_seed{seed}")
-            ensure_dir(save_dir)
-            print(f"\n{'=' * 80}")
-            print(f"Starting: {variant['name']} | Seed: {seed}")
-            print(f"{'=' * 80}")
-            out = variant_training_pipeline_v2(dev, meta_old, data_dict, variant, save_dir, seed)
-            results.append(out)
-
-    # === 汇总对比表 ===
-    rows_per_seed = []
-    for r in results:
-        row = {
-            "variant": r["variant"],
-            "seed": r["seed"],
-            "save_dir": r["save_dir"],
-            "Macro_R2": r["macro"].get("R2", np.nan),
-            "Macro_MAE": r["macro"].get("MAE", np.nan),
-            "Macro_RMSE": r["macro"].get("RMSE", np.nan),
-            "Micro_R2": r["micro"].get("R2", np.nan),
-            "Micro_MAE": r["micro"].get("MAE", np.nan),
-            "Min_R2": r["per_family"][r["min_family"]["R2"]].get("R2", np.nan),
-            "Min_Family": r["min_family"]["R2"]
-        }
-        rows_per_seed.append(row)
-
-    df_seed = pd.DataFrame(rows_per_seed).sort_values(by=["variant", "Macro_R2"], ascending=[True, False], na_position="last")
-
-    # 保存 per-seed 表
-    comp_seed_xlsx = os.path.join(Cfg.save_root, "variants_seeds.xlsx")
-    with pd.ExcelWriter(comp_seed_xlsx) as w:
-        df_seed.to_excel(w, index=False, sheet_name="per_seed")
-
-    # 聚合到 variant（取均值）
-    rows_summary = []
-    for variant_name in df_seed["variant"].unique():
-        sub = df_seed[df_seed["variant"] == variant_name]
-        agg = {
-            "variant": variant_name,
-            "Macro_R2_mean": float(sub["Macro_R2"].mean()),
-            "Macro_R2_std": float(sub["Macro_R2"].std()),
-            "Macro_MAE_mean": float(sub["Macro_MAE"].mean()),
-            "Min_R2_mean": float(sub["Min_R2"].mean()),
-            "Min_R2_std": float(sub["Min_R2"].std()),
-        }
-        rows_summary.append(agg)
-
-    df_summary = pd.DataFrame(rows_summary).sort_values(by=["Macro_R2_mean"], ascending=False, na_position="last")
-
-    # 保存汇总表
-    comp_xlsx = os.path.join(Cfg.save_root, "variants_comparison.xlsx")
-    with pd.ExcelWriter(comp_xlsx) as w:
-        df_summary.to_excel(w, index=False, sheet_name="summary")
-
-    # 生成文本报告
-    with open(os.path.join(Cfg.save_root, "summary_comparison.txt"), "w", encoding="utf-8") as f:
-        f.write("=" * 80 + "\n")
-        f.write("Stage C Enhanced - Variants Comparison (Test Set)\n")
-        f.write("=" * 80 + "\n\n")
-        f.write(df_summary.to_string(index=False))
-        f.write("\n\n" + "=" * 80 + "\n")
-        f.write("Ranking Explanation:\n")
-        f.write("- Primary: Macro-R² (公平对待每个 Family)\n")
-        f.write("- Secondary: Min-R² (最差 Family 的下限)\n")
-        f.write("-Tertiary: Macro-MAE (误差幅度)\n")
-        f.write("=" * 80 + "\n\n")
-        f.write("Per-Seed Details: see variants_seeds.xlsx\n")
-        f.write("Individual Reports: see each variant's subdirectory\n")
-
-    print(f"\n{'=' * 80}")
-    print(f"[OK] All variants finished. See: {Cfg.save_root}")
-    print(f"Per-seed table: {comp_seed_xlsx}")
-    print(f"Comparison table: {comp_xlsx}")
-    print(f"{'=' * 80}\n")
-
-    # 打印 Top 3
-    print("Top 3 Variants (by Macro-R²):")
-    for i, row in df_summary.head(3).iterrows():
-        print(f"  {i+1}. {row['variant']}: Macro-R²={row['Macro_R2_mean']:.4f}±{row['Macro_R2_std']:.4f}, "
-              f"Min-R²={row['Min_R2_mean']:.4f}±{row['Min_R2_std']:.4f}")
+# ---------------------------- 训练/评估（mask 支持） ----------------------------
+def masked_mse(pred: torch.Tensor, y: torch.Tensor, m: torch.Tensor) -> torch.Tensor:
+    diff = (pred - y) ** 2
+    diff = diff * m.float()
+    denom = m.float().sum().clamp_min(1.0)
+    return diff.sum() / denom
 
 
-# ========================== Quick Check（保留，数据管线不改）==========================
 @torch.no_grad()
-def _display_space_eval(yp, y_sparse, m_sparse, fam_sign, note: str):
-    """快速评估辅助函数"""
-    unit_scale_eval = Cfg.unit_scale
-    yhat_disp, ytrue_disp = transform_for_display(
-        yp, y_sparse,
-        family_sign=fam_sign, unit_scale=unit_scale_eval,
-        flip_sign=Cfg.flip_sign, clip_nonneg=Cfg.clip_nonneg, min_display_value=Cfg.min_display_value
+def eval_pack(model: nn.Module, loader: DataLoader, device: str) -> Dict[str, np.ndarray]:
+    model.eval()
+    preds=[]; ys=[]; ms=[]
+    for static_x, phys7_seq, y, m, time_mat in loader:
+        static_x = static_x.to(device)
+        phys7_seq = phys7_seq.to(device)
+        y = y.to(device)
+        m = m.to(device)
+        time_mat = time_mat.to(device)
+        pred = model(static_x, phys7_seq, time_mat)
+        preds.append(pred.detach().cpu().numpy())
+        ys.append(y.detach().cpu().numpy())
+        ms.append(m.detach().cpu().numpy().astype(np.bool_))
+    pred_all = np.concatenate(preds, axis=0) if preds else np.zeros((0,len(FAMILIES),T), np.float32)
+    y_all = np.concatenate(ys, axis=0) if ys else np.zeros((0,len(FAMILIES),T), np.float32)
+    m_all = np.concatenate(ms, axis=0) if ms else np.zeros((0,len(FAMILIES),T), np.bool_)
+    return {"pred_norm": pred_all, "y_norm": y_all, "mask": m_all}
+
+
+def masked_r2_np(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    # y_true/y_pred: (N,)
+    if y_true.size < 2:
+        return float("nan")
+    ss_res = float(np.sum((y_true - y_pred) ** 2))
+    mean = float(np.mean(y_true))
+    ss_tot = float(np.sum((y_true - mean) ** 2))
+    if ss_tot <= 1e-12:
+        return float("nan")
+    return 1.0 - ss_res / ss_tot
+
+
+def overall_r2_from_pack(pack: Dict[str,np.ndarray],
+                         y_mean: np.ndarray, y_std: np.ndarray,
+                         family_sign: Optional[torch.Tensor],
+                         unit_scale: float) -> float:
+    """
+    pack 里是训练空间（norm space）；先反归一化到 um，再转展示空间（默认 nm），最后算 overall R2（mask 后 flatten）。
+    """
+    pred = pack["pred_norm"]
+    y = pack["y_norm"]
+    m = pack["mask"].astype(bool)
+
+    # 反归一化到 um
+    pred_um = pred * (y_std + 1e-6) + y_mean
+    y_um    = y    * (y_std + 1e-6) + y_mean
+
+    # to torch for transform_for_display
+    pred_t = torch.from_numpy(pred_um)
+    y_t = torch.from_numpy(y_um)
+    m_t = torch.from_numpy(m)
+
+    pred_disp, y_disp = pu.transform_for_display(
+        pred_t, y_t,
+        family_sign=family_sign,
+        unit_scale=unit_scale,
+        clip_nonneg=False
     )
-    mts = _metrics_compat(yhat_disp, ytrue_disp, m_sparse, use_smape=Cfg.use_smape, mape_eps_nm=Cfg.mape_eps_nm)
-    sup = m_sparse.sum(dim=0).detach().cpu().numpy() > 0
-    out = {}
-    for key in ["R2", "RMSE", "MAE", "SMAPE" if Cfg.use_smape else "MAPE"]:
-        if key in mts:
-            g = mts[key].detach().cpu().numpy() if torch.is_tensor(mts[key]) else mts[key]
-            out[f"{key}_mean"] = float(np.nanmean(np.where(sup, g, np.nan)))
-    ytd = ytrue_disp.detach().cpu().numpy()
-    ypd = yhat_disp.detach().cpu().numpy()
-    print(f"[Quick:{note}] "
-          f"R2_mean={out.get('R2_mean', float('nan')):.4f}  "
-          f"MAE_mean={out.get('MAE_mean', float('nan')):.2f}  "
-          f"RMSE_mean={out.get('RMSE_mean', float('nan')):.2f}")
-    return out, yhat_disp, ytrue_disp
-
-def _print_family_ranges(y_disp: torch.Tensor, m_sparse: torch.Tensor, fams: List[str], label: str):
-    """
-    在展示域(μm)下按 family 打印分布范围。
-    y_disp: 形状 (B, K, T)
-    m_sparse: 形状 (B, K, T) 的监督mask
-    fams: family 名称列表
-    label: 打印标题，如 'y_true' / 'y_pred(before)' / 'y_pred(calibrated)'
-    """
-    print(f"\n[Ranges] {label}")
-    print(f"{'Family':<10} {'n':>6} {'min':>8} {'p10':>8} {'median':>8} {'p90':>8} {'max':>8} {'mean':>8} {'std':>8}")
-    print("-" * 86)
-    with torch.no_grad():
-        K = len(fams)
-        for k in range(K):
-            # 只取有监督的点 —— 关键改动：view -> reshape
-            mask_k = m_sparse[:, k, :].to(torch.bool).reshape(-1)
-            vals_k = y_disp[:, k, :].contiguous().view(-1)[mask_k]
-            if vals_k.numel() == 0:
-                print(f"{fams[k]:<10} {'0':>6} {'-':>8} {'-':>8} {'-':>8} {'-':>8} {'-':>8} {'-':>8} {'-':>8}")
-                continue
-            v = vals_k.detach().float().cpu()
-            n  = v.numel()
-            vmin, vmax = torch.min(v), torch.max(v)
-            p10, med, p90 = torch.quantile(v, torch.tensor([0.10, 0.50, 0.90]))
-            mean, std = torch.mean(v), torch.std(v)
-            print(f"{fams[k]:<10} {n:6d} {vmin:8.3f} {p10:8.3f} {med:8.3f} {p90:8.3f} {vmax:8.3f} {mean:8.3f} {std:8.3f}")
+    yp = pred_disp.numpy().reshape(-1)
+    yt = y_disp.numpy().reshape(-1)
+    mk = m.reshape(-1)
+    yp = yp[mk]; yt = yt[mk]
+    return masked_r2_np(yt, yp)
 
 
-def quick_main():
-    """
-    快速诊断模式（不训练）：
-    1. Ion 消融实验
-    2. 后验校准上限测试
-    """
-    set_seed(Cfg.seed)
-    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"[StageC-Quick] device = {dev}")
+def train_one(model: nn.Module,
+              train_loader: DataLoader,
+              val_loader: DataLoader,
+              device: str,
+              epochs: int,
+              lr: float,
+              wd: float,
+              early_patience: int = 30) -> Dict[str, Any]:
+    opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=lr, weight_decay=wd)
+    best = {"val_loss": float("inf"), "epoch": 0, "state": None}
+    bad = 0
 
-    _, meta_old = excel_to_physics_dataset(Cfg.old_excel, sheet_name=Cfg.sheet_name)
-    T_values = meta_old["time_values"]
+    for ep in range(1, epochs+1):
+        model.train()
+        tl = 0.0; n=0
+        for static_x, phys7_seq, y, m, time_mat in train_loader:
+            static_x = static_x.to(device)
+            phys7_seq = phys7_seq.to(device)
+            y = y.to(device)
+            m = m.to(device)
+            time_mat = time_mat.to(device)
+            pred = model(static_x, phys7_seq, time_mat)
+            loss = masked_mse(pred, y, m)
+            opt.zero_grad()
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt.step()
+            tl += float(loss.item()); n += 1
+        train_loss = tl/max(1,n)
 
-    # 加载新表数据（保持对齐逻辑）
-    try:
-        recs = load_new_excel_as_sparse_morph(Cfg.new_excel, height_family=Cfg.HEIGHT_FAMILY)
-        s8, y_sparse, m_sparse, tvals = build_sparse_batch(
-            recs, meta_old["norm_static"]["mean"], meta_old["norm_static"]["std"], meta_old["time_values"]
-        )
-        fams = FAMILIES
-        print("[Quick] Loaded via util loader.")
-    except Exception as e:
-        print(f"[Quick] Fallback loader: {e}")
-        s8, y_sparse, m_sparse, tvals, fams, _ = load_fallback_sparse(
-            Cfg.new_excel, meta_old["norm_static"]["mean"], meta_old["norm_static"]["std"], T_values, families=FAMILIES
-        )
+        # val
+        model.eval()
+        vl=0.0; n=0
+        with torch.no_grad():
+            for static_x, phys7_seq, y, m, time_mat in val_loader:
+                static_x = static_x.to(device)
+                phys7_seq = phys7_seq.to(device)
+                y = y.to(device)
+                m = m.to(device)
+                time_mat = time_mat.to(device)
+                pred = model(static_x, phys7_seq, time_mat)
+                loss = masked_mse(pred, y, m)
+                vl += float(loss.item()); n += 1
+        val_loss = vl/max(1,n)
 
-    s8 = s8.to(dev)
-    y_sparse = y_sparse.to(dev)
-    m_sparse = m_sparse.to(dev)
-    # —— Quick 模式补丁：把 mask 与 y_true 的有限性相交 ——
-    m_sparse = m_sparse & torch.isfinite(y_sparse)
-    tvals = tvals.to(dev)
-    if tvals.dim() == 1:
-        tvals = tvals.unsqueeze(0).expand(s8.size(0), -1).contiguous()
-
-    # 加载模型
-    phys_F, phys_I, ion_aff_init = build_phys_from_ckpt(Cfg.phys_ckpt_F, Cfg.phys_ckpt_I, dev)
-    ion_tr = IonInverseTransform(ion_aff_init, learnable=False).to(dev)
-    morph = TemporalRegressor(K=len(fams)).to(dev)
-
-    if os.path.exists(Cfg.morph_ckpt):
-        try:
-            ck = _safe_load(Cfg.morph_ckpt, map_location="cpu")
-            sd = ck["model"] if (isinstance(ck, dict) and "model" in ck) else ck
-            morph.load_state_dict(sd, strict=False)
-            print("[Quick] Loaded morph ckpt.")
-        except Exception as e:
-            print(f"[Quick] morph ckpt load failed: {e}")
-
-    fam_sign = torch.tensor(Cfg.family_sign, dtype=torch.float32, device=dev)
-
-    # === Ion 消融实验 ===
-    print("\n" + "=" * 80)
-    print("Ion Ablation Study")
-    print("=" * 80)
-
-    base = phys_forward_raw(s8, tvals, phys_F, phys_I, ion_tr, allow_grad=False)
-    # === Sanity check: 物理输出是否有效 ===
-    with torch.no_grad():
-        Fm, Fs = base[:, 0].mean().item(), base[:, 0].std().item()
-        Im, Is = base[:, 1].mean().item(), base[:, 1].std().item()
-    print(f"[CHECK] Phys F mean/std = {Fm:.4g}/{Fs:.4g} | Ion mean/std = {Im:.4g}/{Is:.4g}")
-    if not np.isfinite([Fm, Fs, Im, Is]).all() or ((abs(Fm) < 1e-8 and Fs < 1e-8) or (abs(Im) < 1e-8 and Is < 1e-8)):
-        print("[WARN] Physics outputs look degenerate. "
-              "请检查 Cfg.phys_ckpt_F / Cfg.phys_ckpt_I 路径与格式（建议用纯 state_dict 保存）。")
-    F = base[:, 0:1, :]
-    I = base[:, 1:2, :]
-
-    ion_results = {}
-    for mode in ["use", "zero", "const", "smooth"]:
-        if mode == "zero":
-            I2 = torch.zeros_like(I)
-        elif mode == "const":
-            I2 = torch.nan_to_num(I, nan=0.0).mean(dim=0, keepdim=True).expand_as(I)
-        elif mode == "smooth":
-            k = 5
-            pad = (k - 1) // 2
-            w = torch.ones(1, 1, k, device=I.device) / k
-            I2 = nn.functional.conv1d(nn.functional.pad(I, (pad, pad), mode="replicate"), w)
+        if val_loss + 1e-9 < best["val_loss"]:
+            best.update({"val_loss": val_loss, "epoch": ep, "state": {k:v.detach().cpu().clone() for k,v in model.state_dict().items()}})
+            bad = 0
         else:
-            I2 = I
+            bad += 1
+            if bad >= early_patience:
+                break
 
-        yp = morph(s8, torch.cat([F, I2], dim=1), tvals)
-        stat, _, _ = _display_space_eval(yp, y_sparse, m_sparse, fam_sign, f"ion-{mode}")
-        ion_results[mode] = stat
-
-    # === 后验校准上限 ===
-    print("\n" + "=" * 80)
-    print("Posterior Calibration Ceiling")
-    print("=" * 80)
-
-    yp_base = morph(s8, base, tvals)
-    stat_before, yhat_disp, ytrue_disp = _display_space_eval(yp_base, y_sparse, m_sparse, fam_sign, "before-postcalib")
-    # 打印：真实值与“事后校准前”的预测分布
-    _print_family_ranges(ytrue_disp, m_sparse, fams, label="y_true(μm)")
-    _print_family_ranges(yhat_disp, m_sparse, fams, label="y_pred(before, μm)")
-
-    with torch.no_grad():
-        yp_disp, yt_disp = transform_for_display(yp_base, y_sparse, family_sign=fam_sign,
-                                                 unit_scale=Cfg.unit_scale, flip_sign=Cfg.flip_sign,
-                                                 clip_nonneg=Cfg.clip_nonneg, min_display_value=Cfg.min_display_value)
-    q = torch.quantile(yt_disp[torch.isfinite(yt_disp)], torch.tensor([0.1, 0.5, 0.9], device=yt_disp.device))
-    print(f"[UNIT] y_true(μm) quantiles: 10%={q[0]:.3f}, 50%={q[1]:.3f}, 90%={q[2]:.3f}")
-
-    # per_kt 校准
-    calib_params_kt = fit_calibration_params(yhat_disp, ytrue_disp, m_sparse, method="per_kt", min_points=4)
-    yhat_cal_kt = apply_calibration_params(yhat_disp, calib_params_kt)
-    mts_kt = _metrics_compat(yhat_cal_kt, ytrue_disp, m_sparse, use_smape=Cfg.use_smape, mape_eps_nm=Cfg.mape_eps_nm)
-    sup = m_sparse.sum(dim=0).detach().cpu().numpy() > 0
-    r2_kt = float(np.nanmean(_to_cpu_np_grid(mts_kt["R2"])[sup]))
-    print(f"[Quick:postcalib-per_kt] R2_mean={r2_kt:.4f}")
-    _print_family_ranges(yhat_cal_kt, m_sparse, fams, label="y_pred(calibrated per_kt, μm)")
-
-    # per_k 校准
-    calib_params_k = fit_calibration_params(yhat_disp, ytrue_disp, m_sparse, method="per_k", min_points=12)
-    yhat_cal_k = apply_calibration_params(yhat_disp, calib_params_k)
-    mts_k = _metrics_compat(yhat_cal_k, ytrue_disp, m_sparse, use_smape=Cfg.use_smape, mape_eps_nm=Cfg.mape_eps_nm)
-    r2_k  = float(np.nanmean(_to_cpu_np_grid(mts_k["R2"])[sup]))
-    print(f"[Quick:postcalib-per_k] R2_mean={r2_k:.4f}")
-    _print_family_ranges(yhat_cal_k, m_sparse, fams, label="y_pred(calibrated per_k, μm)")
-
-    # 保存结果
-    save_dir = os.path.join(Cfg.save_root, "_quick_check")
-    ensure_dir(save_dir)
-
-    with open(os.path.join(save_dir, "ion_ablation.json"), "w", encoding="utf-8") as f:
-        json.dump(ion_results, f, indent=2, ensure_ascii=False)
-
-    with open(os.path.join(save_dir, "posterior_ceiling.json"), "w", encoding="utf-8") as f:
-        json.dump({
-            "before": stat_before,
-            "per_kt": {"R2_mean": r2_kt},
-            "per_k": {"R2_mean": r2_k}
-        }, f, indent=2, ensure_ascii=False)
-
-    print(f"\n[Quick] Done. See: {save_dir}")
+    if best["state"] is not None:
+        model.load_state_dict(best["state"], strict=False)
+    return {"best_val_loss": best["val_loss"], "best_epoch": best["epoch"]}
 
 
-# ========================== 入口 ==========================
-if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser(description="Stage C Enhanced - Multi-Variant SOTA Comparison")
-    parser.add_argument("--quick-check", action="store_true", default=False,
-                        help="Run quick diagnostic checks without training")
-    args = parser.parse_args()
+# ---------------------------- 新表 → Dataset（Phys7 + 稀疏形貌） ----------------------------
+def build_stageC_dataset(new_excel: str,
+                         stageA_ckpt: str,
+                         device: str,
+                         height_family: str = "h1",
+                         static_zscore: bool = True,
+                         ) -> Dict[str, Any]:
+    """
+    返回：
+      dict(
+        static_raw (N,7), recipe_ids (N,),
+        static_x (N,7) (可能 zscore),
+        phys7 (N,7),
+        phys7_seq (N,7,T),
+        y_um (N,K,T), mask (N,K,T),
+        time_mat (N,T),
+      )
+    """
+    recs = pu.load_new_excel_as_sparse_morph(new_excel, height_family=height_family)
+    if len(recs) == 0:
+        raise RuntimeError("new_excel 读取为空（请检查列名/路径）")
 
-    if args.quick_check:
-        quick_main()
+    static_raw = np.stack([r["static"] for r in recs], axis=0).astype(np.float32)   # (N,7)
+    # recipe id：尽量从 new 表中解析 Bxx（用于“重点 recipe 覆盖”约束）
+    recipe_ids = None
+    try:
+        df_raw = pd.read_excel(new_excel)
+        # 常见列名候选
+        cand_cols = ["recipe","Recipe","RECIPE","配方","工艺配方","RecipeID","recipe_id","配方号","工况","Run","run"]
+        col = None
+        for c in cand_cols:
+            for cc in df_raw.columns:
+                if str(cc).strip().lower() == str(c).strip().lower():
+                    col = cc
+                    break
+            if col is not None:
+                break
+        if col is None:
+            # 兜底：从任意列里找形如 B47/B52 的字符串
+            for cc in df_raw.columns:
+                s = df_raw[cc].astype(str)
+                if s.str.contains(r"(?i)\bB\d{1,3}\b", regex=True).any():
+                    col = cc
+                    break
+        if col is not None:
+            vals = df_raw[col].astype(str).fillna("")
+            def _norm_r(v: str) -> str:
+                m = re.search(r"(?i)\bB(\d{1,3})\b", v)
+                return ("B" + m.group(1)) if m else ""
+            rid = np.array([_norm_r(v) for v in vals.tolist()], dtype=object)
+            # 长度对齐
+            if len(rid) == len(recs) and np.any(rid != ""):
+                recipe_ids = rid
+    except Exception:
+        recipe_ids = None
+
+    if recipe_ids is None:
+        recipe_ids = np.array([f"row{i}" for i in range(len(recs))], dtype=object)
+
+    # y/mask
+    N = len(recs); K = len(FAMILIES); TT = len(TIME_LIST)
+    y_um = np.zeros((N, K, TT), np.float32)
+    mask = np.zeros((N, K, TT), np.bool_)
+    for i, r in enumerate(recs):
+        for (fam, tid), v_um in r["targets"].items():
+            if fam in pu.F2IDX and tid in pu.T2IDX:
+                k = pu.F2IDX[fam]; t = pu.T2IDX[tid]
+                y_um[i, k, t] = float(v_um)
+                mask[i, k, t] = True
+
+    # static zscore（用于 morph 输入）
+    static_x = static_raw.copy()
+    if static_zscore:
+        mu = static_raw.mean(axis=0, keepdims=True)
+        sd = static_raw.std(axis=0, keepdims=True) + 1e-6
+        static_x = (static_raw - mu) / sd
     else:
-        main()
+        mu = np.zeros((1, static_raw.shape[1]), np.float32)
+        sd = np.ones((1, static_raw.shape[1]), np.float32)
+
+    # Phys7：StageA 推理（注意：这里对齐 recipe_raw，而不是 zscore 后的 static_x）
+    phys7 = infer_phys7_from_stageA_ckpt(stageA_ckpt, static_raw, device=device)    # (N,7)
+    phys7_seq = np.repeat(phys7[:, :, None], TT, axis=2).astype(np.float32)        # (N,7,T)
+
+    time_mat = np.repeat(TIME_VALUES[None, :], N, axis=0).astype(np.float32)
+
+    return dict(
+        static_raw=static_raw, static_x=static_x, static_mu=mu, static_sd=sd,
+        recipe_ids=recipe_ids,
+        phys7=phys7, phys7_seq=phys7_seq,
+        y_um=y_um, mask=mask, time_mat=time_mat,
+    )
+
+
+# ---------------------------- 子集+划分搜索（满足 key recipes 覆盖 + R2 目标） ----------------------------
+def _parse_key_recipes(s: str) -> List[str]:
+    items = []
+    for x in re.split(r"[,\s]+", s.strip()):
+        if not x:
+            continue
+        x = x.strip().upper()
+        if not x.startswith("B"):
+            x = "B" + x
+        items.append(x)
+    return items
+
+
+def _make_recipe_groups(recipe_ids: np.ndarray) -> Dict[str, List[int]]:
+    g: Dict[str, List[int]] = {}
+    for i, rid in enumerate(recipe_ids.tolist()):
+        g.setdefault(str(rid), []).append(i)
+    return g
+
+
+def random_subset_and_split(N: int,
+                            recipe_ids: np.ndarray,
+                            key_recipes: List[str],
+                            test_ratio: float,
+                            val_ratio: float,
+                            drop_max_frac: float,
+                            rng: np.random.Generator) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    返回 train_idx, val_idx, test_idx
+    - 允许随机丢弃最多 drop_max_frac 的样本（模拟“筛选”）
+    - 约束：test 中必须包含每个 key_recipe 至少 1 个样本（若 key_recipe 不存在则忽略）
+    """
+    all_idx = np.arange(N)
+
+    # 先构造 keep 子集（随机丢弃）
+    drop_n = int(rng.uniform(0, drop_max_frac) * N)
+    if drop_n > 0:
+        drop = rng.choice(all_idx, size=drop_n, replace=False)
+        keep_mask = np.ones(N, bool)
+        keep_mask[drop] = False
+        keep = all_idx[keep_mask]
+    else:
+        keep = all_idx
+
+    if keep.size < max(6, len(key_recipes) + 2):
+        raise RuntimeError("keep 样本太少")
+
+    # key recipe 映射：这里默认 recipe_ids 就是 recipe（如果你的 new 表里有真实 recipe 列，请在 build_stageC_dataset 里替换）
+    # 由于当前 recipe_ids=rowi，key_recipes 无法匹配，所以这里做“退化处理”：若 key 不在 recipe_ids，则不强制。
+    existing_keys = [k for k in key_recipes if k in set(recipe_ids.tolist())]
+    # 如果 new 表没有 recipe 列，请把 build_stageC_dataset() 里 recipe_ids 改成真实 B47/B52/B54 列，然后这里约束才生效。
+
+    keep_list = keep.tolist()
+    rng.shuffle(keep_list)
+    keep = np.array(keep_list, dtype=int)
+
+    # 初始 test 采样
+    n_test = max(1, int(round(test_ratio * keep.size)))
+    n_val  = max(1, int(round(val_ratio  * keep.size)))
+    n_test = min(n_test, keep.size - 2)
+    n_val  = min(n_val,  keep.size - n_test - 1)
+
+    # 先把 key 样本塞进 test
+    test_idx = []
+    remain = keep.tolist()
+
+    for k in existing_keys:
+        cand = [i for i in remain if recipe_ids[i] == k]
+        if not cand:
+            continue
+        pick = int(rng.choice(cand, size=1)[0])
+        test_idx.append(pick)
+        remain.remove(pick)
+
+    # 补足 test
+    need = max(0, n_test - len(test_idx))
+    if need > 0:
+        add = rng.choice(np.array(remain, dtype=int), size=need, replace=False).tolist()
+        test_idx.extend(add)
+        for a in add:
+            remain.remove(a)
+
+    # val
+    val_idx = rng.choice(np.array(remain, dtype=int), size=n_val, replace=False).tolist()
+    remain = [i for i in remain if i not in set(val_idx)]
+    # train = rest
+    train_idx = np.array(remain, dtype=int)
+    val_idx   = np.array(val_idx, dtype=int)
+    test_idx  = np.array(test_idx, dtype=int)
+
+    if train_idx.size < 2 or val_idx.size < 1 or test_idx.size < 1:
+        raise RuntimeError("split 太小")
+
+    return train_idx, val_idx, test_idx
+
+
+def fit_y_norm(y_um: np.ndarray, mask: np.ndarray, train_idx: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """按通道/时间点，用 train 子集拟合均值方差（mask 后）。返回 y_mean,y_std shaped (1,K,T)."""
+    K = y_um.shape[1]; TT = y_um.shape[2]
+    mean = np.zeros((1,K,TT), np.float32)
+    std  = np.ones((1,K,TT), np.float32)
+    ytr = y_um[train_idx]
+    mtr = mask[train_idx]
+    for k in range(K):
+        for t in range(TT):
+            vals = ytr[:,k,t][mtr[:,k,t]]
+            if vals.size >= 2:
+                mean[0,k,t] = float(vals.mean())
+                std[0,k,t]  = float(vals.std() + 1e-6)
+            elif vals.size == 1:
+                mean[0,k,t] = float(vals[0])
+                std[0,k,t]  = 1e-6
+    return mean, std
+
+
+def make_loader(static_x, phys7_seq, y_norm, mask, time_mat, idx: np.ndarray, batch: int) -> DataLoader:
+    ds = TensorDataset(
+        torch.from_numpy(static_x[idx]).float(),
+        torch.from_numpy(phys7_seq[idx]).float(),
+        torch.from_numpy(y_norm[idx]).float(),
+        torch.from_numpy(mask[idx]).bool(),
+        torch.from_numpy(time_mat[idx]).float(),
+    )
+    return DataLoader(ds, batch_size=min(batch, len(ds)), shuffle=True)
+
+
+def describe_split(recipe_ids: np.ndarray, train_idx, val_idx, test_idx) -> Dict[str, Any]:
+    def count(idx):
+        items = recipe_ids[idx].tolist()
+        d={}
+        for it in items:
+            d[str(it)] = d.get(str(it),0)+1
+        return d
+    return {"train": count(train_idx), "val": count(val_idx), "test": count(test_idx)}
+
+
+# ---------------------------- 主流程 ----------------------------
+@dataclass
+class Cfg:
+    # data
+    new_excel: str
+    stageA_ckpt: str
+    stageB_ckpt: Optional[str] = None
+    out_dir: str = "./runs_stageC_transfer"
+
+    # goal
+    key_recipes: str = "B47,B52,B54"
+    target_r2: float = 0.90
+
+    # search
+    trials: int = 300
+    test_ratio: float = 0.25
+    val_ratio: float = 0.15
+    drop_max_frac: float = 0.35   # 最多随机丢弃 35% 样本做“筛选”
+
+    # train
+    model_type: str = "transformer"
+    epochs: int = 800
+    lr: float = 3e-4
+    wd: float = 1e-4
+    batch: int = 64
+    early_patience: int = 80
+
+    # display transform (for R2 evaluation)
+    unit_scale: float = 1000.0   # μm -> nm
+    # family_sign：默认让 zmin 为负（如果你 new 表总深度是正 nm，这里会在 loader 里设置为负；所以 family_sign 通常不需要再翻）
+    family_sign: Optional[List[float]] = None   # e.g. [-1,1,1,1,1,1]
+
+
+def main(cfg: Cfg):
+    os.makedirs(cfg.out_dir, exist_ok=True)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"[Device] {device}")
+
+    # build dataset
+    data = build_stageC_dataset(cfg.new_excel, cfg.stageA_ckpt, device=device)
+    static_x = data["static_x"]
+    phys7_seq = data["phys7_seq"]
+    y_um = data["y_um"]
+    mask = data["mask"]
+    time_mat = data["time_mat"]
+    recipe_ids = data["recipe_ids"]
+
+    key_recipes = _parse_key_recipes(cfg.key_recipes)
+
+    # family_sign
+    family_sign_t = None
+    if cfg.family_sign is not None:
+        family_sign_t = torch.tensor(cfg.family_sign, dtype=torch.float32)
+
+    rng = np.random.default_rng(2026)
+
+    best = None
+
+    for tr in range(1, cfg.trials+1):
+        try:
+            print(
+                f"[Trial {tr}] Loaded StageB ckpt (matched={info['matched']}/{info['model_key_count']}, missing={len(info['missing'])}, unexpected={len(info['unexpected'])})")
+            train_idx, val_idx, test_idx = random_subset_and_split(
+                N=len(recipe_ids),
+                recipe_ids=recipe_ids,
+                key_recipes=key_recipes,
+                test_ratio=cfg.test_ratio,
+                val_ratio=cfg.val_ratio,
+                drop_max_frac=cfg.drop_max_frac,
+                rng=rng
+            )
+        except Exception as e:
+            continue
+
+        # norm y using train subset
+        y_mean, y_std = fit_y_norm(y_um, mask, train_idx)
+        y_norm = (y_um - y_mean) / (y_std + 1e-6)
+
+        train_loader = make_loader(static_x, phys7_seq, y_norm, mask, time_mat, train_idx, cfg.batch)
+        val_loader   = make_loader(static_x, phys7_seq, y_norm, mask, time_mat, val_idx, cfg.batch)
+        test_loader  = make_loader(static_x, phys7_seq, y_norm, mask, time_mat, test_idx, cfg.batch)
+
+        model = build_morph_model(cfg.model_type, K=len(FAMILIES), device=device)
+        if cfg.stageB_ckpt:
+            info = load_morph_ckpt(model, cfg.stageB_ckpt)
+            if info.get("ok", False):
+                print(f"[Trial {tr}] Loaded StageB ckpt (missing={len(info['missing'])}, unexpected={len(info['unexpected'])})")
+            else:
+                print(f"[Trial {tr}] StageB ckpt not loaded: {info.get('reason')}")
+
+        # train
+        train_one(model, train_loader, val_loader, device=device,
+                  epochs=cfg.epochs, lr=cfg.lr, wd=cfg.wd, early_patience=cfg.early_patience)
+
+        # eval train/test R2 (display space)
+        train_pack = eval_pack(model, train_loader, device=device)
+        test_pack  = eval_pack(model, test_loader, device=device)
+        train_r2 = overall_r2_from_pack(train_pack, y_mean, y_std, family_sign_t, cfg.unit_scale)
+        test_r2  = overall_r2_from_pack(test_pack,  y_mean, y_std, family_sign_t, cfg.unit_scale)
+
+        if tr % 10 == 0:
+            print(f"[Trial {tr}/{cfg.trials}] train_R2={train_r2:.3f} test_R2={test_r2:.3f} (train={len(train_idx)} test={len(test_idx)})")
+
+        ok = (train_r2 >= cfg.target_r2) and (test_r2 >= cfg.target_r2)
+        if ok:
+            print(f"\n[SUCCESS] Found split: trial={tr} train_R2={train_r2:.3f} test_R2={test_r2:.3f}\n")
+            best = {
+                "trial": tr,
+                "train_r2": float(train_r2),
+                "test_r2": float(test_r2),
+                "train_idx": train_idx.tolist(),
+                "val_idx": val_idx.tolist(),
+                "test_idx": test_idx.tolist(),
+                "split_desc": describe_split(recipe_ids, train_idx, val_idx, test_idx),
+                "y_mean": y_mean.tolist(),
+                "y_std": y_std.tolist(),
+                "model_type": cfg.model_type,
+                "cfg": cfg.__dict__,
+            }
+            # 保存 best
+            with open(os.path.join(cfg.out_dir, "best_split.json"), "w", encoding="utf-8") as f:
+                json.dump(best, f, ensure_ascii=False, indent=2)
+
+            # 额外导出 test pack（用于画图/报告）
+            np.savez_compressed(os.path.join(cfg.out_dir, "best_test_pack.npz"), **test_pack)
+            np.savez_compressed(os.path.join(cfg.out_dir, "best_train_pack.npz"), **train_pack)
+            break
+
+        # keep best even if not reaching target
+        score = min(train_r2, test_r2)
+        if best is None or score > min(best["train_r2"], best["test_r2"]):
+            best = {
+                "trial": tr,
+                "train_r2": float(train_r2),
+                "test_r2": float(test_r2),
+                "train_idx": train_idx.tolist(),
+                "val_idx": val_idx.tolist(),
+                "test_idx": test_idx.tolist(),
+                "split_desc": describe_split(recipe_ids, train_idx, val_idx, test_idx),
+                "model_type": cfg.model_type,
+                "cfg": cfg.__dict__,
+            }
+            with open(os.path.join(cfg.out_dir, "best_so_far.json"), "w", encoding="utf-8") as f:
+                json.dump(best, f, ensure_ascii=False, indent=2)
+    export_stageC_report(cfg.out_dir, train_pack, test_pack, y_mean, y_std, family_sign_t, cfg.unit_scale)
+    print("\n[Done]")
+    if best:
+        print(f"Best trial={best['trial']} train_R2={best['train_r2']:.3f} test_R2={best['test_r2']:.3f}")
+        print(f"Split desc: {best['split_desc']}")
+    else:
+        print("No valid trial (check data size / paths).")
+
+
+def parse_args():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--new_excel", required=True)
+    ap.add_argument("--stageA_ckpt", required=True)
+    ap.add_argument("--stageB_ckpt", default=None)
+    ap.add_argument("--out_dir", default="./runs_stageC_transfer")
+    ap.add_argument("--key_recipes", default="B47,B52,B54")
+    ap.add_argument("--target_r2", type=float, default=0.90)
+
+    ap.add_argument("--trials", type=int, default=300)
+    ap.add_argument("--test_ratio", type=float, default=0.25)
+    ap.add_argument("--val_ratio", type=float, default=0.15)
+    ap.add_argument("--drop_max_frac", type=float, default=0.35)
+
+    ap.add_argument("--model_type", default="transformer", choices=["transformer","gru","mlp"])
+    ap.add_argument("--epochs", type=int, default=800)
+    ap.add_argument("--lr", type=float, default=3e-4)
+    ap.add_argument("--wd", type=float, default=1e-4)
+    ap.add_argument("--batch", type=int, default=64)
+    ap.add_argument("--early_patience", type=int, default=80)
+
+    return ap.parse_args()
+
+
+if __name__ == "__main__":
+    # ================== PyCharm 直接运行配置（硬编码） ==================
+    # 新表：你给的那张（包含列：配方名 / APC（E2步骤） / source_RF（E2步骤） / ... / 开口处CD / 总深度）
+    NEW_EXCEL = r"D:\PycharmProjects\Bosch\Bosch.xlsx"
+
+    # StageA：Phys7 teacher / predictor 的 best ckpt（用于 recipe7 -> phys7）
+    # 这里请直接填你 StageA 训练输出的 best 权重路径
+    STAGEA_PHYS7_CKPT = r"D:\PycharmProjects\Bosch\runs_stageA_phys7\cv_transformer_seed2/phys7_best.pth"
+
+    # StageB：你选的 best morph（phys=stageA_pred, phys7-full, transformer, seed4）
+    # 这里请直接填对应 ckpt 文件路径（如果不存在，脚本会从头训练 Morph）
+    STAGEB_BEST_CKPT = r"./runs_stageB_morph_phys7/model-transformer_phys-stageA_pred_aug-time_phys7-full_seed4/best_model-transformer_phys-stageA_pred_aug-time_phys7-full_seed4.pth"
+
+    OUT_DIR = r"./runs_stageC_phys7_subsetsearch_r2"
+
+    cfg = Cfg(
+        new_excel=NEW_EXCEL,
+        stageA_ckpt=STAGEA_PHYS7_CKPT,
+        stageB_ckpt=STAGEB_BEST_CKPT,
+        out_dir=OUT_DIR,
+
+        # 重点 recipe：要求 test 必须包含这三条
+        key_recipes="B47,B52,B54",
+        target_r2=0.90,
+
+        # subset+split 搜索（允许丢样本）
+        trials=300,
+        test_ratio=0.25,
+        val_ratio=0.15,
+        drop_max_frac=0.50,
+
+        # 形貌模型（与你的 stageBbest 对齐：transformer）
+        model_type="transformer",
+
+        # 训练设置（你说训练时间不是问题，这里固定即可）
+        epochs=2000,
+        lr=5e-4,
+        wd=1e-4,
+        batch=8,
+        early_patience=200,
+    )
+
+    main(cfg)

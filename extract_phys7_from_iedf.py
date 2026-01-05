@@ -5,25 +5,44 @@ import glob
 import json
 import numpy as np
 import pandas as pd
+import argparse
+import matplotlib.pyplot as plt
 
 # ===================== 配置区（按你的路径改） =====================
 CASE_XLSX   = r"D:\PycharmProjects\Bosch\case.xlsx"
 CASE_SHEET  = "case"
 CASE_ID_COL = "input"   # 你的 case id（cas1/cas2/...）在这一列
 
-
 IEDF_ROOT   = r"D:\BaiduNetdiskDownload\TSV"
 
-# 固定：根据你数据结构
+OUT_XLSX    = r"D:\PycharmProjects\Bosch\case_with_phys7.xlsx"
+OUT_JSON    = r"D:\PycharmProjects\Bosch\phys7_manifest.json"
+
+# ===================== 可视化（论文用）配置 =====================
+# 生成 IEDF + CDF + E10/E50/E90 标注图，默认开启
+MAKE_FIGS = True
+FIG_DIR = r"D:\PycharmProjects\Bosch\fig_iedf_examples"
+FIG_N_CASES = 12
+FIG_SEED = 0
+FIG_STRATEGY = "phys7_fps"   # "phys7_fps"(最远点采样) / "random" / "extremes"
+FIG_INCLUDE_EXTREMES = True   # 先加工艺极值/中值，再用 Phys7 多样性补齐
+FIG_LOGY = False              # IEDF 是否用对数 y 轴（想看尾部可 True）
+FIG_WITH_TOTAL = True         # 是否绘制总离子(聚合)曲线
+
+# 固定：根据你数据结构（只取你指定的 dominant ions）
 TARGETS = {
     ("SF6",  "sheath2"): ["F_1p", "SF3_1p", "SF4_1p", "SF5_1p"],
     ("C4F8", "sheath1"): ["CF3_1p", "C2F3_1p"],
 }
 
-OUT_XLSX    = r"D:\PycharmProjects\Bosch\case_with_phys7.xlsx"
-OUT_JSON    = r"D:\PycharmProjects\Bosch\phys7_manifest.json"
+# 固定：Phys7 特征名（用于抽样与可视化）
+FAMILIES = [
+    "logGamma_SF6_tot","pF_SF6","spread_SF6","qskew_SF6",
+    "logGamma_C4F8_tot","rho_C4F8","spread_C4F8"
+]
 
-EPS = 1e-30  # 防止除零 / log(0)
+# 数值稳定
+EPS = 1e-30
 
 # 双峰判别参数（不是能量阈值；是形状判别的“显著性”）
 SMOOTH_WIN = 9                 # 移动平均窗口（奇数更好）
@@ -33,10 +52,8 @@ VALLEY_RATIO_TH = 0.80         # 峰间谷值需“足够低”：valley/min(pea
 
 # ===================== 工具函数 =====================
 def canon(s: str) -> str:
-    s = str(s).strip().lower()
-    s = re.sub(r"\s+", "", s)
-    s = s.replace("（", "(").replace("）", ")")
-    return s
+    # 只保留 [a-z0-9]，把下划线、括号、单位、斜杠都统一消掉
+    return re.sub(r"[^a-z0-9]+", "", str(s).strip().lower())
 
 def find_case_id_col(df: pd.DataFrame) -> str:
     cands = ["标识case", "case", "caseid", "id"]
@@ -57,190 +74,61 @@ def parse_gas_sheath_from_filename(fp: str):
     return m.group(1), m.group(2)
 
 def pick_energy_col(df: pd.DataFrame) -> str:
+    # 优先找明确的 Energy 列
     for c in df.columns:
-        if "energy" in canon(c):
+        if canon(c).startswith("energyev") or canon(c) == "energy":
             return c
+    # 兜底：包含 energy 且不是 energy_distribution
+    for c in df.columns:
+        cc = canon(c)
+        if ("energy" in cc) and ("energydistribution" not in cc):
+            return c
+    # 最兜底：第一列
     return df.columns[0]
 
-def pick_ion_col(df: pd.DataFrame, ion_prefix: str):
-    pref = canon(ion_prefix)
-    for c in df.columns:
-        if canon(c).startswith(pref):
-            return c
-    return None
 
-def moving_average(y, win=9):
-    win = int(win)
-    if win <= 1:
+def pick_ion_col(df: pd.DataFrame, ion: str):
+    ion_key = canon(ion) + "energydistribution"
+    best = None
+    for c in df.columns:
+        cc = canon(c)
+        if cc.startswith(ion_key):
+            return c
+        # 兜底：只要同时包含 ion 和 energydistribution
+        if (canon(ion) in cc) and ("energydistribution" in cc):
+            best = c
+    return best
+
+
+def moving_average(y: np.ndarray, win: int):
+    if win is None or win <= 1:
         return y
+    win = int(win)
     if win % 2 == 0:
         win += 1
     k = np.ones(win, dtype=float) / win
     return np.convolve(y, k, mode="same")
 
-def local_maxima_indices(y):
-    if len(y) < 3:
+def local_maxima_indices(y: np.ndarray):
+    """
+    简单峰值检测：y[i-1] < y[i] >= y[i+1]
+    """
+    if y.size < 3:
         return np.array([], dtype=int)
     return np.where((y[1:-1] > y[:-2]) & (y[1:-1] >= y[2:]))[0] + 1
 
-def cumulative_trapz(x, y):
+def cumulative_trapz(x: np.ndarray, y: np.ndarray):
     """
-    返回 F[k] = ∫_{x0}^{xk} y dx  (梯形累计积分)
+    CDF: ∫0^x y dx（离散梯形累积）
     """
     x = np.asarray(x, float)
     y = np.asarray(y, float)
     if x.size < 2:
         return np.zeros_like(x)
     dx = np.diff(x)
-    area_seg = 0.5 * (y[:-1] + y[1:]) * dx
-    F = np.concatenate([[0.0], np.cumsum(area_seg)])
-    return F
-
-def quantile_energy(x, y, q):
-    """
-    y>=0 的分布，返回满足累计比例为 q 的能量 E_q
-    使用累计积分 + 线性插值
-    """
-    x = np.asarray(x, float)
-    y = np.asarray(y, float)
-    # 保证非负（数值噪声）
-    y = np.maximum(y, 0.0)
-    F = cumulative_trapz(x, y)
-    tot = F[-1]
-    if not np.isfinite(tot) or tot <= 0:
-        return np.nan
-    C = F / tot
-    # 防止重复值导致 interp 失败：做单调化
-    # 但 C 本来应单调非减；这里轻微修正
-    C = np.maximum.accumulate(C)
-    return float(np.interp(q, C, x))
-
-def detect_bimodal_flag(x, g):
-    """
-    在归一化形状 g(E) 上判别“显著双峰”：
-    - 两个局部极大值，间隔 >= MIN_PEAK_SEP_BINS
-    - 第二峰高度 >= SECOND_PEAK_MIN_FRAC * 第一峰高度
-    - 两峰间谷值 valley/min(peak1,peak2) <= VALLEY_RATIO_TH
-    """
-    x = np.asarray(x, float)
-    g = np.asarray(g, float)
-    if x.size < 3:
-        return 0
-
-    gs = moving_average(g, win=SMOOTH_WIN)
-    pidx = local_maxima_indices(gs)
-    if pidx.size < 2:
-        return 0
-
-    # 按峰高排序
-    cand = pidx[np.argsort(gs[pidx])[::-1]]
-    p1 = cand[0]
-    p2 = None
-    for j in cand[1:]:
-        if abs(j - p1) >= MIN_PEAK_SEP_BINS:
-            p2 = j
-            break
-    if p2 is None:
-        return 0
-
-    # 两峰排序（左->右）
-    if p1 > p2:
-        p1, p2 = p2, p1
-
-    h1 = float(gs[p1])
-    h2 = float(gs[p2])
-    if h1 <= 0 or h2 <= 0:
-        return 0
-    if h2 < SECOND_PEAK_MIN_FRAC * h1:
-        return 0
-
-    # 谷值（两峰之间）
-    mid = slice(p1, p2 + 1)
-    v_rel = int(np.argmin(gs[mid]))
-    v = p1 + v_rel
-    valley = float(gs[v])
-
-    ratio = valley / (min(h1, h2) + EPS)
-    return 1 if ratio <= VALLEY_RATIO_TH else 0
-
-def read_target_iedf_for_case(case_id: str):
-    """
-    返回 dict: {(gas,sheath): filepath}
-    只选 TARGETS 里需要的文件；若缺失则该 key 不存在
-    """
-    pattern = os.path.join(IEDF_ROOT, "scan*", str(case_id), "*_energy_distribution.csv")
-    fps = sorted(glob.glob(pattern))
-    got = {}
-    for fp in fps:
-        gas, sheath = parse_gas_sheath_from_filename(fp)
-        if (gas, sheath) in TARGETS:
-            got[(gas, sheath)] = fp
-    return got
-
-def compute_phys7_from_file(fp: str, gas: str, sheath: str, ions: list[str]):
-    """
-    从一个 gas+sheath 的 IEDF 文件里提取：
-    - per-ion Gamma
-    - 聚合 f_agg(E) -> 归一化 g(E) -> E10/E90 spread
-    - bimodal_flag（只对 SF6 sheath2 会被上层取用）
-    """
-    df = pd.read_csv(fp)
-    e_col = pick_energy_col(df)
-    x = df[e_col].to_numpy(dtype=float)
-
-    # 排序 + 清理
-    ok = np.isfinite(x)
-    x = x[ok]
-    if x.size < 3:
-        return None
-
-    sort_idx = np.argsort(x)
-    x = x[sort_idx]
-
-    # 聚合离子曲线
-    gammas = {}
-    f_agg = np.zeros_like(x, dtype=float)
-
-    for ion in ions:
-        c = pick_ion_col(df, ion)
-        if c is None:
-            gammas[ion] = np.nan
-            continue
-        y_full = df[c].to_numpy(dtype=float)[ok][sort_idx]
-        y_full = np.where(np.isfinite(y_full), y_full, 0.0)
-        y_full = np.maximum(y_full, 0.0)
-
-        Gamma = float(trapz_compat(y_full, x)) if x.size >= 2 else np.nan
-
-        gammas[ion] = Gamma
-        f_agg += y_full
-
-    Gamma_tot = float(trapz_compat(f_agg, x)) if x.size >= 2 else np.nan
-    # 归一化形状
-    g = f_agg / (Gamma_tot + EPS) if (np.isfinite(Gamma_tot) and Gamma_tot > 0) else np.full_like(f_agg, np.nan)
-
-    # 分位点与展宽
-    E10 = quantile_energy(x, g, 0.10) if np.all(np.isfinite(g)) else np.nan
-    E50 = quantile_energy(x, g, 0.50) if np.all(np.isfinite(g)) else np.nan
-    E90 = quantile_energy(x, g, 0.90) if np.all(np.isfinite(g)) else np.nan
-
-    spread = float(E90 - E10) if (np.isfinite(E10) and np.isfinite(E90)) else np.nan
-
-    qskew = (
-        float((E90 + E10 - 2.0 * E50) / (spread + EPS))
-        if (np.isfinite(E10) and np.isfinite(E50) and np.isfinite(E90) and np.isfinite(spread) and spread > 0)
-        else np.nan
-    )
-
-    return {
-        "Gamma_tot": Gamma_tot,
-        "gammas": gammas,
-        "E10": E10,
-        "E50": E50,
-        "E90": E90,
-        "spread": spread,
-        "qskew": qskew,
-    }
+    mid = 0.5 * (y[1:] + y[:-1])
+    c = np.concatenate([[0.0], np.cumsum(mid * dx)])
+    return c
 
 def trapz_compat(y, x):
     fn = getattr(np, "trapezoid", None)
@@ -248,8 +136,415 @@ def trapz_compat(y, x):
         return np.trapz(y, x)
     return fn(y, x)
 
+def quantile_energy(x: np.ndarray, f: np.ndarray, q: float):
+    """
+    计算累计通量分位点能量 Eq：∫0^Eq f dE = q * ∫0^∞ f dE
+    """
+    x = np.asarray(x, float)
+    f = np.clip(np.asarray(f, float), 0.0, None)
+    if x.size < 2:
+        return np.nan
+    total = float(trapz_compat(f, x))
+    if (not np.isfinite(total)) or total <= 0:
+        return np.nan
+    c = cumulative_trapz(x, f) / (total + EPS)
+    return float(np.interp(q, c, x))
+
+def detect_bimodal_flag(x: np.ndarray, f: np.ndarray) -> int:
+    """
+    形状判别双峰（用于诊断/可视化，不作为 Phys7 必选特征）
+    """
+    x = np.asarray(x, float)
+    f = np.clip(np.asarray(f, float), 0.0, None)
+    if x.size < 10:
+        return 0
+
+    g = moving_average(f, SMOOTH_WIN)
+    peaks = local_maxima_indices(g)
+    if peaks.size < 2:
+        return 0
+
+    # 取最高的两个峰
+    order = np.argsort(g[peaks])[::-1]
+    p1 = int(peaks[order[0]])
+    p2 = int(peaks[order[1]])
+
+    if abs(p2 - p1) < MIN_PEAK_SEP_BINS:
+        return 0
+
+    # 两峰排序（左->右）
+    if p1 > p2:
+        p1, p2 = p2, p1
+
+    h1 = float(g[p1])
+    h2 = float(g[p2])
+    if h1 <= 0 or h2 <= 0:
+        return 0
+    if h2 < SECOND_PEAK_MIN_FRAC * h1:
+        return 0
+
+    # 谷值（峰间最小）
+    valley = float(np.min(g[p1:p2+1]))
+    if valley / max(EPS, min(h1, h2)) > VALLEY_RATIO_TH:
+        return 0
+    return 1
+
+# ===================== 读取 IEDF 文件 =====================
+def read_target_iedf_for_case(case_id: str):
+    """
+    在 IEDF_ROOT 下找：
+    scan*/casX/*_energy_distribution.csv
+    返回 dict: {(gas,sheath): filepath}
+    """
+    cid = str(case_id).strip()
+    # 允许 "case1" -> "cas1"
+    m = re.fullmatch(r"(?i)case(\d+)", cid)
+    if m:
+        cid = f"cas{m.group(1)}"
+    if re.fullmatch(r"\d+", cid):
+        cid = f"cas{cid}"
+
+    # scan1-100/scan101-200/... 都兼容
+    patt = os.path.join(IEDF_ROOT, "scan*", cid, "*_energy_distribution.csv")
+    fps = glob.glob(patt)
+    out = {}
+    for fp in fps:
+        gas, sheath = parse_gas_sheath_from_filename(fp)
+        if gas is None:
+            continue
+        key = (gas, sheath)
+        if key in TARGETS:
+            out[key] = fp
+    return out
+
+def compute_phys7_from_file(csv_path: str, gas: str, sheath: str, ions: list):
+    """
+    从一个 csv 中提取：
+    - 每个离子的通量 Gamma_i = ∫ f_i(E) dE
+    - 聚合离子分布 f_agg(E) = Σ f_i(E)
+    - 总通量 Gamma_tot = ∫ f_agg(E) dE
+    - E10/E50/E90, spread=(E90-E10)/E50, qskew=(E90+E10-2E50)/(E90-E10)
+    """
+    df = pd.read_csv(csv_path)
+    ecol = pick_energy_col(df)
+    x = df[ecol].to_numpy(np.float64)
+
+    gammas = {}
+    ys = []
+    for ion in ions:
+        col = pick_ion_col(df, ion)
+        if col is None:
+            continue
+        y = df[col].to_numpy(np.float64)
+        y = np.where(np.isfinite(y), y, 0.0)
+        y = np.clip(y, 0.0, None)
+        Gamma = float(trapz_compat(y, x)) if x.size >= 2 else np.nan
+        gammas[ion] = Gamma
+        ys.append(y)
+
+    if len(ys) == 0:
+        return None
+
+    f_agg = np.sum(np.stack(ys, axis=0), axis=0)
+    Gamma_tot = float(trapz_compat(f_agg, x)) if x.size >= 2 else np.nan
+
+    E10 = quantile_energy(x, f_agg, 0.10)
+    E50 = quantile_energy(x, f_agg, 0.50)
+    E90 = quantile_energy(x, f_agg, 0.90)
+
+    spread = np.nan
+    qskew = np.nan
+    if np.isfinite(E10) and np.isfinite(E50) and np.isfinite(E90) and E50 > 0 and (E90 - E10) > 0:
+        spread = float((E90 - E10) / (E50 + EPS))
+        qskew = float((E90 + E10 - 2.0 * E50) / (E90 - E10 + EPS))
+
+    return {
+        "gas": gas, "sheath": sheath,
+        "x": x,
+        "gammas": gammas,
+        "Gamma_tot": Gamma_tot,
+        "E10": E10, "E50": E50, "E90": E90,
+        "spread": spread,
+        "qskew": qskew,
+    }
+
+# ===================== IEDF 可视化辅助（论文图） =====================
+def _zscore(X: np.ndarray):
+    mu = np.nanmean(X, axis=0, keepdims=True)
+    sd = np.nanstd(X, axis=0, keepdims=True) + 1e-6
+    return (X - mu) / sd
+
+def farthest_point_sampling(X: np.ndarray, n: int, seed: int = 0):
+    """
+    最远点采样（farthest point sampling），用于在 Phys7 空间选“最有显示度”的多样样本。
+    X: (N,d)
+    """
+    rng = np.random.default_rng(seed)
+    N = X.shape[0]
+    if N == 0:
+        return []
+    n = min(n, N)
+    start = int(rng.integers(0, N))
+    chosen = [start]
+    dist = np.full(N, np.inf, dtype=np.float64)
+    for _ in range(1, n):
+        last = X[chosen[-1]]
+        d = np.sum((X - last) ** 2, axis=1)
+        dist = np.minimum(dist, d)
+        nxt = int(np.argmax(dist))
+        chosen.append(nxt)
+    return chosen
+
+def find_recipe7_cols(df: pd.DataFrame):
+    """
+    从 case.xlsx 里自动找 7 维 recipe 列（允许中文/带括号列名）。
+    """
+    cols = list(df.columns)
+    def pick(pats):
+        for c in cols:
+            v = canon(c)
+            if any(p in v for p in pats):
+                return c
+        return None
+
+    apc = pick(["apc"])
+    source_rf = pick(["source_rf", "sourcerf", "rfsource"])
+    lf_rf = pick(["lf_rf", "lfrf", "bias"])
+    sf6 = pick(["sf6"])
+    c4f8 = pick(["c4f8"])
+    dep_t = pick(["deptime", "dep_time", "dep时间", "dep"])
+    etch_t = pick(["etchtime", "etch_time", "etch时间", "etch"])
+
+    recipe_cols = [apc, source_rf, lf_rf, sf6, c4f8, dep_t, etch_t]
+    if not all(recipe_cols):
+        return None
+    return recipe_cols
+
+def select_cases_for_figs(df_case: pd.DataFrame, df_feat: pd.DataFrame, case_col: str,
+                          n: int = 12, seed: int = 0,
+                          strategy: str = "phys7_fps",
+                          include_extremes: bool = True):
+    """
+    df_case: 原始 case 表
+    df_feat: 每个 case 的 Phys7 特征表（含 case_id）
+    返回：case_id list
+    """
+    rng = np.random.default_rng(seed)
+
+    tmp = df_case.copy()
+    tmp["_cid_"] = tmp[case_col].astype(str)
+    tmp = tmp.merge(df_feat, how="left", left_on="_cid_", right_on="case_id", validate="one_to_one")
+
+    # 至少有一套 IEDF：SF6 或 C4F8 特征非空
+    ok_any = tmp[["logGamma_SF6_tot", "logGamma_C4F8_tot"]].notna().any(axis=1).to_numpy()
+    tmp2 = tmp.loc[ok_any].reset_index(drop=True)
+    if len(tmp2) == 0:
+        return []
+
+    chosen = set()
+
+    # (1) 工艺覆盖：极值/中值（可选）
+    recipe_cols = find_recipe7_cols(df_case) if include_extremes else None
+    if recipe_cols is not None:
+        apc_c, src_c, lf_c, sf6_c, c4_c, dep_c, etch_c = recipe_cols
+        ratio = (tmp2[dep_c].astype(float) / (tmp2[etch_c].astype(float) + 1e-9)).to_numpy()
+
+        axes = [
+            (lf_c, tmp2[lf_c].astype(float).to_numpy()),
+            (apc_c, tmp2[apc_c].astype(float).to_numpy()),
+            (src_c, tmp2[src_c].astype(float).to_numpy()),
+            ("dep/etch", ratio),
+        ]
+        for _, arr in axes:
+            if arr.size == 0:
+                continue
+            order = np.argsort(arr)
+            picks = []
+            picks += order[:2].tolist()
+            picks += order[max(0, len(order)//2 - 1): min(len(order), len(order)//2 + 1)].tolist()
+            picks += order[-2:].tolist()
+            for pi in picks:
+                chosen.add(int(pi))
+
+    # (2) Phys7 多样性：最远点采样补齐
+    X = tmp2[FAMILIES].to_numpy(np.float64)
+    col_mean = np.nanmean(X, axis=0, keepdims=True)
+    X = np.where(np.isfinite(X), X, col_mean)
+    X = _zscore(X)
+
+    remaining = n - len(chosen)
+    if remaining > 0:
+        if strategy == "random":
+            pool = [i for i in range(len(tmp2)) if i not in chosen]
+            rng.shuffle(pool)
+            for i in pool[:remaining]:
+                chosen.add(int(i))
+        elif strategy == "extremes":
+            pool = [i for i in range(len(tmp2)) if i not in chosen]
+            rng.shuffle(pool)
+            for i in pool[:remaining]:
+                chosen.add(int(i))
+        else:
+            fps_idx = farthest_point_sampling(X, n=n, seed=seed)
+            for i in fps_idx:
+                chosen.add(int(i))
+            chosen = set(sorted(chosen)[:n])
+
+    chosen_idx = sorted(list(chosen))[:n]
+    case_ids = tmp2.loc[chosen_idx, "_cid_"].astype(str).tolist()
+    return case_ids
+
+def plot_iedf_multi_with_cdf(E: np.ndarray, ion_y: dict, out_png: str, title: str,
+                            logy: bool = False, with_total: bool = True):
+    """
+    画：多离子 IEDF（左轴） + 聚合 CDF（右轴） + E10/E50/E90 标注
+    ion_y: {ion_name: y(E)}
+    """
+    ions = list(ion_y.keys())
+    if not ions:
+        return
+
+    f_agg = None
+    for ion in ions:
+        y = ion_y[ion]
+        f_agg = y if f_agg is None else (f_agg + y)
+
+    Gamma_tot = float(trapz_compat(f_agg, E)) if E.size >= 2 else np.nan
+    if (not np.isfinite(Gamma_tot)) or Gamma_tot <= 0:
+        return
+
+    E10 = quantile_energy(E, f_agg, 0.10)
+    E50 = quantile_energy(E, f_agg, 0.50)
+    E90 = quantile_energy(E, f_agg, 0.90)
+    cdf = cumulative_trapz(E, f_agg) / (Gamma_tot + EPS)
+
+    plt.figure(figsize=(7.0, 4.0))
+    ax = plt.gca()
+
+    for ion in ions:
+        ax.plot(E, ion_y[ion], label=ion)
+    if with_total:
+        ax.plot(E, f_agg, linewidth=2.0, label="sum")
+
+    if logy:
+        ax.set_yscale("log")
+        ax.set_ylabel("energy_distribution (log scale)")
+    else:
+        ax.set_ylabel("energy_distribution")
+
+    ax.set_xlabel("Energy (eV)")
+    ax.set_title(title)
+
+    ax2 = ax.twinx()
+    ax2.plot(E, cdf, linestyle="--", label="CDF (sum)")
+    ax2.set_ylabel("cumulative flux / Γ")
+
+    for (q, e_q) in [(10, E10), (50, E50), (90, E90)]:
+        if np.isfinite(e_q):
+            ax.axvline(e_q, linestyle=":", linewidth=1.2)
+            ax.text(e_q, ax.get_ylim()[1]*0.95, f"E{q}", rotation=90, va="top")
+
+    ax.text(0.02, 0.02,
+            f"Γ={Gamma_tot:.3e}\nE10={E10:.2f}, E50={E50:.2f}, E90={E90:.2f}",
+            transform=ax.transAxes, fontsize=9,
+            bbox=dict(boxstyle="round", facecolor="white", alpha=0.7))
+
+    h1, l1 = ax.get_legend_handles_labels()
+    h2, l2 = ax2.get_legend_handles_labels()
+    ax.legend(h1 + h2, l1 + l2, loc="upper right", fontsize=8)
+
+    plt.tight_layout()
+    os.makedirs(os.path.dirname(out_png), exist_ok=True)
+    plt.savefig(out_png, dpi=300)
+    plt.close()
+
+def make_figures(case_ids: list, fig_dir: str, seed: int = 0,
+                 logy: bool = False, with_total: bool = True):
+    """
+    为选中的 case 生成论文图：
+    - SF6 sheath2: F+, SF3+, SF4+, SF5+
+    - C4F8 sheath1: CF3+, C2F3+
+    每个 case 两张图（如果对应 CSV 存在）
+    """
+    for cid in case_ids:
+        files = read_target_iedf_for_case(cid)
+
+        # SF6 sheath2
+        key_sf6 = ("SF6", "sheath2")
+        if key_sf6 in files:
+            fp = files[key_sf6]
+            ions = TARGETS[key_sf6]
+            df = pd.read_csv(fp)
+            E = df[pick_energy_col(df)].to_numpy(np.float64)
+            ion_y = {}
+            for ion in ions:
+                col = pick_ion_col(df, ion)
+                if col is None:
+                    continue
+                y = df[col].to_numpy(np.float64)
+                y = np.where(np.isfinite(y), y, 0.0)
+                y = np.clip(y, 0.0, None)
+                ion_y[ion] = y
+            if ion_y:
+                out_png = os.path.join(fig_dir, f"{cid}", "SF6_sheath2_iedf_cdf.png")
+                plot_iedf_multi_with_cdf(
+                    E, ion_y, out_png,
+                    title=f"{cid} — SF6 sheath2 IEDF (ions) + CDF",
+                    logy=logy, with_total=with_total
+                )
+
+        # C4F8 sheath1
+        key_c4 = ("C4F8", "sheath1")
+        if key_c4 in files:
+            fp = files[key_c4]
+            ions = TARGETS[key_c4]
+            df = pd.read_csv(fp)
+            E = df[pick_energy_col(df)].to_numpy(np.float64)
+            ion_y = {}
+            for ion in ions:
+                col = pick_ion_col(df, ion)
+                if col is None:
+                    continue
+                y = df[col].to_numpy(np.float64)
+                y = np.where(np.isfinite(y), y, 0.0)
+                y = np.clip(y, 0.0, None)
+                ion_y[ion] = y
+            if ion_y:
+                out_png = os.path.join(fig_dir, f"{cid}", "C4F8_sheath1_iedf_cdf.png")
+                plot_iedf_multi_with_cdf(
+                    E, ion_y, out_png,
+                    title=f"{cid} — C4F8 sheath1 IEDF (ions) + CDF",
+                    logy=logy, with_total=with_total
+                )
+
 # ===================== 主流程 =====================
 def main():
+    global CASE_XLSX, CASE_SHEET, CASE_ID_COL, IEDF_ROOT, OUT_XLSX, OUT_JSON
+
+    parser = argparse.ArgumentParser(description="Extract Phys7 features from IEDF and optionally generate visualization figures.")
+    parser.add_argument("--case_xlsx", default=CASE_XLSX)
+    parser.add_argument("--case_sheet", default=CASE_SHEET)
+    parser.add_argument("--case_id_col", default=CASE_ID_COL)
+    parser.add_argument("--iedf_root", default=IEDF_ROOT)
+    parser.add_argument("--out_xlsx", default=OUT_XLSX)
+    parser.add_argument("--out_json", default=OUT_JSON)
+
+    # 开关：默认按 MAKE_FIGS；用 --no_figs 关闭
+    parser.add_argument("--no_figs", dest="make_figs", action="store_false", default=MAKE_FIGS)
+
+    parser.add_argument("--fig_dir", default=FIG_DIR)
+    parser.add_argument("--fig_n_cases", type=int, default=FIG_N_CASES)
+    parser.add_argument("--fig_seed", type=int, default=FIG_SEED)
+    parser.add_argument("--fig_strategy", default=FIG_STRATEGY)
+    parser.add_argument("--no_fig_extremes", dest="fig_include_extremes", action="store_false", default=FIG_INCLUDE_EXTREMES)
+    parser.add_argument("--fig_logy", action="store_true", default=FIG_LOGY)
+    parser.add_argument("--no_fig_total", dest="fig_with_total", action="store_false", default=FIG_WITH_TOTAL)
+    args = parser.parse_args()
+
+    CASE_XLSX, CASE_SHEET, CASE_ID_COL = args.case_xlsx, args.case_sheet, args.case_id_col
+    IEDF_ROOT = args.iedf_root
+    OUT_XLSX, OUT_JSON = args.out_xlsx, args.out_json
+
     df_case = pd.read_excel(CASE_XLSX, sheet_name=CASE_SHEET)
     case_col = CASE_ID_COL if CASE_ID_COL in df_case.columns else find_case_id_col(df_case)
     case_ids = df_case[case_col].astype(str).tolist()
@@ -259,7 +554,6 @@ def main():
 
     for cid in case_ids:
         files = read_target_iedf_for_case(cid)
-
         row = {"case_id": cid}
 
         # ---------- SF6 sheath2 ----------
@@ -290,7 +584,6 @@ def main():
 
                 G1 = out["gammas"].get("CF3_1p", np.nan)
                 G2 = out["gammas"].get("C2F3_1p", np.nan)
-                # log 比值，避免数量级差
                 row["rho_C4F8"] = float(np.log10((G1 + EPS) / (G2 + EPS))) if (np.isfinite(G1) and np.isfinite(G2)) else np.nan
 
                 row["spread_C4F8"] = out["spread"]
@@ -319,11 +612,7 @@ def main():
         "case_xlsx": CASE_XLSX,
         "iedf_root": IEDF_ROOT,
         "targets": {f"{k[0]}_{k[1]}": v for k, v in TARGETS.items()},
-        "features": [
-          "logGamma_SF6_tot","pF_SF6","spread_SF6","qskew_SF6",
-          "logGamma_C4F8_tot","rho_C4F8","spread_C4F8"
-        ]
-        ,
+        "features": FAMILIES,
         "params": {
             "EPS": EPS,
             "SMOOTH_WIN": SMOOTH_WIN,
@@ -343,6 +632,30 @@ def main():
     print(f"[OK] Saved manifest: {OUT_JSON}")
     if missing:
         print(f"[WARN] cases missing BOTH target files (show first 20): {missing[:20]} (total={len(missing)})")
+
+    # ---------- 可视化：抽样生成 IEDF/CDF 论文图 ----------
+    if args.make_figs:
+        case_ids_vis = select_cases_for_figs(
+            df_case=df_case,
+            df_feat=df_feat,
+            case_col=case_col,
+            n=args.fig_n_cases,
+            seed=args.fig_seed,
+            strategy=args.fig_strategy,
+            include_extremes=args.fig_include_extremes,
+        )
+        if len(case_ids_vis) == 0:
+            print("[WARN] make_figs enabled but no valid cases found for visualization.")
+        else:
+            print(f"[OK] make_figs: selected {len(case_ids_vis)} cases: {case_ids_vis}")
+            make_figures(
+                case_ids_vis,
+                fig_dir=args.fig_dir,
+                seed=args.fig_seed,
+                logy=args.fig_logy,
+                with_total=args.fig_with_total,
+            )
+            print(f"[OK] Figures saved under: {args.fig_dir}")
 
 if __name__ == "__main__":
     main()

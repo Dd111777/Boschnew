@@ -5,10 +5,15 @@
   </component>
   <component name="ChangeListManager">
     <list default="true" id="089379c4-7cfb-4299-905f-3a8550c713ee" name="更改" comment="12.">
-      <change afterPath="$PROJECT_DIR$/build_pca_features_from_iedf.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/extract_phys7_from_iedf.py" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/stageA_train_phys_pycharm_old.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/compare_meas_vs_sim.py" beforeDir="false" afterPath="$PROJECT_DIR$/compare_meas_vs_sim.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/Bosch.xlsx" beforeDir="false" afterPath="$PROJECT_DIR$/Bosch.xlsx" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/case.xlsx" beforeDir="false" afterPath="$PROJECT_DIR$/case.xlsx" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/extract_phys7_from_iedf.py" beforeDir="false" afterPath="$PROJECT_DIR$/extract_phys7_from_iedf.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/phys_model.py" beforeDir="false" afterPath="$PROJECT_DIR$/phys_model.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/physio_util.py" beforeDir="false" afterPath="$PROJECT_DIR$/physio_util.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/stageA_train_phys_pycharm.py" beforeDir="false" afterPath="$PROJECT_DIR$/stageA_train_phys_pycharm.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/stageC_finetune_joint_on_new_pycharm.py" beforeDir="false" afterPath="$PROJECT_DIR$/stageC_finetune_joint_on_new_pycharm.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -62,6 +67,9 @@
     "Python.extract_phys7_from_iedf.executor": "Run",
     "Python.plasma.executor": "Run",
     "Python.sss.executor": "Run",
+    "Python.stageA_train_phys_pycharm.executor": "Run",
+    "Python.stageB_train_morph_on_phys7_pycharm.executor": "Run",
+    "Python.stageC_finetune_joint_on_new_pycharm.executor": "Run",
     "Python.stageC_finetune_joint_on_new_pycharm_new.executor": "Run",
     "Python.stageCselection.executor": "Run",
     "Python.test.executor": "Run",
