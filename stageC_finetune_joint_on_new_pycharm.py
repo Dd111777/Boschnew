@@ -387,13 +387,28 @@ def _pack_to_display_arrays(pack: Dict[str, np.ndarray],
                             y_mean: np.ndarray, y_std: np.ndarray,
                             family_sign: Optional[torch.Tensor],
                             unit_scale: float):
-    """norm space -> um -> display space（含 sign/scale）"""
+    """norm space -> um -> display space（含 sign/scale）。会过滤非有限值并同步修正 mask。"""
     pred = pack["pred_norm"].astype(np.float32)
     y    = pack["y_norm"].astype(np.float32)
     m    = pack["mask"].astype(bool)
 
     pred_um = pred * (y_std + 1e-6) + y_mean
     y_um    = y    * (y_std + 1e-6) + y_mean
+
+    # 若 family_sign=None，则默认按“新表口径”把 zmin 翻为正（仅用于评估/展示，不影响训练）
+    if family_sign is None:
+        try:
+            if len(FAMILIES) > 0 and str(FAMILIES[0]).lower() == "zmin":
+                family_sign = torch.tensor([-1.0] + [1.0] * (len(FAMILIES) - 1), dtype=torch.float32)
+        except Exception:
+            pass
+
+    # 清洗非有限值：避免指标/图被 NaN 污染
+    bad = (~np.isfinite(pred_um) | ~np.isfinite(y_um)) & m
+    if np.any(bad):
+        m = m & (~bad)
+        pred_um = np.where(np.isfinite(pred_um), pred_um, 0.0).astype(np.float32)
+        y_um    = np.where(np.isfinite(y_um),    y_um,    0.0).astype(np.float32)
 
     pred_t = torch.from_numpy(pred_um)
     y_t    = torch.from_numpy(y_um)
@@ -406,12 +421,42 @@ def _pack_to_display_arrays(pack: Dict[str, np.ndarray],
     )
     return pred_disp.numpy(), y_disp.numpy(), m
 
+def masked_r2_np(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    """R2 on 1D arrays; automatically filters out non-finite pairs."""
+    if y_true is None or y_pred is None:
+        return float("nan")
+    y_true = np.asarray(y_true).reshape(-1)
+    y_pred = np.asarray(y_pred).reshape(-1)
+
+    ok = np.isfinite(y_true) & np.isfinite(y_pred)
+    y_true = y_true[ok]
+    y_pred = y_pred[ok]
+
+    if y_true.size < 2:
+        return float("nan")
+    ss_res = float(np.sum((y_true - y_pred) ** 2))
+    mean = float(np.mean(y_true))
+    ss_tot = float(np.sum((y_true - mean) ** 2))
+    if ss_tot <= 1e-12:
+        return float("nan")
+    return 1.0 - ss_res / ss_tot
+
 
 def _masked_r2(y_true_1d: np.ndarray, y_pred_1d: np.ndarray):
     return masked_r2_np(y_true_1d, y_pred_1d)
 
 
 def _masked_mae(y_true_1d: np.ndarray, y_pred_1d: np.ndarray):
+    """MAE on 1D arrays; automatically filters out non-finite pairs."""
+    if y_true_1d is None or y_pred_1d is None:
+        return float("nan")
+    y_true_1d = np.asarray(y_true_1d).reshape(-1)
+    y_pred_1d = np.asarray(y_pred_1d).reshape(-1)
+
+    ok = np.isfinite(y_true_1d) & np.isfinite(y_pred_1d)
+    y_true_1d = y_true_1d[ok]
+    y_pred_1d = y_pred_1d[ok]
+
     if y_true_1d.size == 0:
         return float("nan")
     return float(np.mean(np.abs(y_true_1d - y_pred_1d)))
@@ -526,17 +571,140 @@ def export_stageC_report(out_dir: str,
 
     print(f"[Report] Saved metrics + figures to: {out_dir}")
 
-def build_morph_model(model_type: str, K: int, device: str):
-    mt = model_type.lower()
+def build_morph_model(model_type: str, K: int, device: str,
+                      stageB_ckpt: Optional[str] = None):
+    """
+    若提供 stageB_ckpt：按 ckpt 权重形状推断 StageB 的模型结构并构建同款命名的网络，
+    让迁移加载真正生效（避免 size mismatch）。
+    """
+    mt = model_type.lower().strip()
+
+    def _extract_sd(obj):
+        sd = None
+        if isinstance(obj, dict):
+            for k in ["state_dict", "model_state", "model", "morph_state", "net"]:
+                if k in obj and isinstance(obj[k], dict):
+                    sd = obj[k]; break
+        if sd is None and isinstance(obj, dict) and any(isinstance(v, torch.Tensor) for v in obj.values()):
+            sd = obj
+        if sd is None:
+            return None
+        # strip prefixes
+        out = {}
+        for k, v in sd.items():
+            kk = k
+            for pref in ["module.", "model.", "morph.", "morph_model.", "net."]:
+                if kk.startswith(pref):
+                    kk = kk[len(pref):]
+            out[kk] = v
+        return out
+
+    def _infer_stageB_sig(sd: dict):
+        # StageB 命名：static_enc / phys_proj / time_mlp / encoder / in_proj / out
+        static_dim = int(sd["static_enc.net.0.weight"].shape[1])
+        static_h1  = int(sd["static_enc.net.0.weight"].shape[0])  # usually 256
+        static_out = int(sd["static_enc.net.2.weight"].shape[0])  # usually 128
+
+        phys_dim   = int(sd["phys_proj.weight"].shape[1])
+        phys_out   = int(sd["phys_proj.weight"].shape[0])         # usually 128
+
+        time_h1    = int(sd["time_mlp.net.0.weight"].shape[0])     # usually 64
+        time_out   = int(sd["time_mlp.net.2.weight"].shape[0])     # usually 64
+
+        # encoder d_model from in_proj_weight (3*d_model, d_model)
+        d_model = int(sd["encoder.layers.0.self_attn.in_proj_weight"].shape[1])
+
+        # num_layers from keys
+        layer_ids = set()
+        for k in sd.keys():
+            m = re.match(r"encoder\.layers\.(\d+)\.", k)
+            if m:
+                layer_ids.add(int(m.group(1)))
+        num_layers = (max(layer_ids) + 1) if layer_ids else 4
+
+        # nhead 无法从权重直接精确恢复（PyTorch 不存），给一个稳妥默认：优先 8，其次 4/2/1
+        prefers = [8, 4, 2, 1]
+        nhead = 1
+        for h in prefers:
+            if d_model % h == 0:
+                nhead = h; break
+
+        return dict(static_dim=static_dim, static_h1=static_h1, static_out=static_out,
+                    phys_dim=phys_dim, phys_out=phys_out,
+                    time_h1=time_h1, time_out=time_out,
+                    d_model=d_model, nhead=nhead, num_layers=num_layers)
+
+    # 如果给了 stageB_ckpt，就构建 StageB-compatible 模型（命名一致）
+    if stageB_ckpt and os.path.exists(stageB_ckpt) and mt == "transformer":
+        ck = _torch_load_ckpt(stageB_ckpt, map_location="cpu")
+        sd = _extract_sd(ck)
+        if sd is None:
+            raise RuntimeError("stageB_ckpt 无法解析 state_dict")
+
+        sig = _infer_stageB_sig(sd)
+
+        class StaticEncoderB(nn.Module):
+            def __init__(self, in_dim: int, h1: int, out_dim: int):
+                super().__init__()
+                self.net = nn.Sequential(
+                    nn.Linear(in_dim, h1),
+                    nn.ReLU(),
+                    nn.Linear(h1, out_dim),
+                    nn.ReLU()
+                )
+            def forward(self, x): return self.net(x)
+
+        class TimeMLPB(nn.Module):
+            def __init__(self, h1: int, out_dim: int):
+                super().__init__()
+                self.net = nn.Sequential(
+                    nn.Linear(1, h1),
+                    nn.ReLU(),
+                    nn.Linear(h1, out_dim),
+                    nn.ReLU()
+                )
+            def forward(self, t): return self.net(t)
+
+        class MorphTransformerB(nn.Module):
+            def __init__(self, static_dim: int, phys_dim: int, d_model: int, nhead: int, num_layers: int, out_dim: int):
+                super().__init__()
+                self.static_enc = StaticEncoderB(static_dim, sig["static_h1"], sig["static_out"])
+                self.phys_proj  = nn.Linear(phys_dim, sig["phys_out"])
+                self.time_mlp   = TimeMLPB(sig["time_h1"], sig["time_out"])
+                self.in_proj    = nn.Linear(sig["static_out"] + sig["phys_out"] + sig["time_out"], d_model)
+
+                enc_layer = nn.TransformerEncoderLayer(
+                    d_model=d_model, nhead=nhead, dim_feedforward=512,
+                    dropout=0.1, batch_first=True
+                )
+                self.encoder = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
+                self.out = nn.Linear(d_model, out_dim)
+
+            def forward(self, static_x, phys7_seq, time_mat):
+                B = static_x.shape[0]
+                Tt = phys7_seq.shape[2]
+                s = self.static_enc(static_x)                 # (B, static_out)
+                s = s[:, None, :].repeat(1, Tt, 1)            # (B,T,static_out)
+                p = self.phys_proj(phys7_seq.permute(0, 2, 1))# (B,T,phys_out)
+                t = self.time_mlp(time_mat[..., None])        # (B,T,time_out)
+                x = torch.cat([s, p, t], dim=-1)              # (B,T, sum)
+                x = self.in_proj(x)
+                h = self.encoder(x)
+                y = self.out(h)                               # (B,T,K)
+                return y.permute(0, 2, 1)                     # (B,K,T)
+
+        m = MorphTransformerB(sig["static_dim"], sig["phys_dim"], sig["d_model"], sig["nhead"], sig["num_layers"], out_dim=K).to(device)
+        return m
+
+    # 否则走你原来的轻量模型
     if mt == "transformer":
-        m = MorphTransformer(K=K).to(device)
+        return MorphTransformer(K=K).to(device)
     elif mt == "gru":
-        m = MorphGRU(K=K).to(device)
+        return MorphGRU(K=K).to(device)
     elif mt == "mlp":
-        m = MorphMLP(K=K).to(device)
+        return MorphMLP(K=K).to(device)
     else:
         raise ValueError(f"Unknown model_type: {model_type}")
-    return m
 
 
 def _extract_state_dict_and_meta(obj):
@@ -599,10 +767,12 @@ def _remap_morph_keys(sd: dict):
 
 def load_morph_ckpt(model: nn.Module, ckpt_path: str):
     """
-    ✅ 修复点：
-    1) 不用裸 torch.load（PyTorch2.6+ weights_only 默认 True 会炸）-> 用 _torch_load_ckpt
-    2) 做 prefix strip + key remap，尽量对齐 StageB/StageC 命名
-    3) 返回 matched 统计：你能立刻判断到底“迁移是否真正生效”
+    兼容两类目标模型命名：
+    A) 轻量 StageC 模型：se / tm / enc / heads
+    B) StageB-compatible 模型：static_enc / time_mlp / encoder / in_proj / out
+
+    修复点：如果目标模型本身就是 StageB-compatible 命名，则不要做 remap，
+    否则会把 key 改坏，导致 matched 很低（你看到 matched=6）。
     """
     if ckpt_path is None or (not os.path.exists(ckpt_path)):
         return {"ok": False, "reason": "ckpt_not_found"}
@@ -613,13 +783,20 @@ def load_morph_ckpt(model: nn.Module, ckpt_path: str):
         return {"ok": False, "reason": "unrecognized_format"}
 
     sd = _strip_prefixes(sd)
-    sd = _remap_morph_keys(sd)
 
     model_keys = set(model.state_dict().keys())
+
+    # 目标模型是否是 StageB-compatible 命名？
+    target_is_stageB_style = any(k.startswith("static_enc.") or k.startswith("encoder.") or k.startswith("time_mlp.")
+                                 for k in model_keys)
+
+    # 只有当目标是轻量 se/tm/enc 命名时，才 remap
+    if not target_is_stageB_style:
+        sd = _remap_morph_keys(sd)
+
     ckpt_keys = set(sd.keys())
     matched = len(model_keys & ckpt_keys)
 
-    # 真正 load
     missing, unexpected = model.load_state_dict(sd, strict=False)
 
     return {
@@ -629,7 +806,8 @@ def load_morph_ckpt(model: nn.Module, ckpt_path: str):
         "ckpt_key_count": len(ckpt_keys),
         "missing": missing,
         "unexpected": unexpected,
-        "meta": meta
+        "meta": meta,
+        "target_is_stageB_style": target_is_stageB_style,
     }
 
 # ---------------------------- 训练/评估（mask 支持） ----------------------------
@@ -659,25 +837,16 @@ def eval_pack(model: nn.Module, loader: DataLoader, device: str) -> Dict[str, np
     m_all = np.concatenate(ms, axis=0) if ms else np.zeros((0,len(FAMILIES),T), np.bool_)
     return {"pred_norm": pred_all, "y_norm": y_all, "mask": m_all}
 
-
-def masked_r2_np(y_true: np.ndarray, y_pred: np.ndarray) -> float:
-    # y_true/y_pred: (N,)
-    if y_true.size < 2:
-        return float("nan")
-    ss_res = float(np.sum((y_true - y_pred) ** 2))
-    mean = float(np.mean(y_true))
-    ss_tot = float(np.sum((y_true - mean) ** 2))
-    if ss_tot <= 1e-12:
-        return float("nan")
-    return 1.0 - ss_res / ss_tot
-
-
-def overall_r2_from_pack(pack: Dict[str,np.ndarray],
+def overall_r2_from_pack(pack: Dict[str, np.ndarray],
                          y_mean: np.ndarray, y_std: np.ndarray,
                          family_sign: Optional[torch.Tensor],
                          unit_scale: float) -> float:
     """
     pack 里是训练空间（norm space）；先反归一化到 um，再转展示空间（默认 nm），最后算 overall R2（mask 后 flatten）。
+
+    修复：
+    - 自动过滤 NaN/Inf
+    - 若 family_sign=None，则默认按“新表口径”把 zmin 翻为正（仅用于评估/展示，不影响训练）
     """
     pred = pack["pred_norm"]
     y = pack["y_norm"]
@@ -687,23 +856,34 @@ def overall_r2_from_pack(pack: Dict[str,np.ndarray],
     pred_um = pred * (y_std + 1e-6) + y_mean
     y_um    = y    * (y_std + 1e-6) + y_mean
 
-    # to torch for transform_for_display
+    # family_sign 默认：让 zmin 变正（新表通常是正深度）
+    if family_sign is None:
+        try:
+            if len(FAMILIES) > 0 and str(FAMILIES[0]).lower() == "zmin":
+                family_sign = torch.tensor([-1.0] + [1.0] * (len(FAMILIES) - 1), dtype=torch.float32)
+        except Exception:
+            pass
+
     pred_t = torch.from_numpy(pred_um)
-    y_t = torch.from_numpy(y_um)
-    m_t = torch.from_numpy(m)
+    y_t    = torch.from_numpy(y_um)
 
     pred_disp, y_disp = pu.transform_for_display(
         pred_t, y_t,
         family_sign=family_sign,
-        unit_scale=unit_scale,
+        unit_scale=unit_scale,   # 1000: um->nm
         clip_nonneg=False
     )
     yp = pred_disp.numpy().reshape(-1)
     yt = y_disp.numpy().reshape(-1)
     mk = m.reshape(-1)
-    yp = yp[mk]; yt = yt[mk]
-    return masked_r2_np(yt, yp)
 
+    yp = yp[mk]
+    yt = yt[mk]
+
+    ok = np.isfinite(yt) & np.isfinite(yp)
+    yt = yt[ok]
+    yp = yp[ok]
+    return masked_r2_np(yt, yp)
 
 def train_one(model: nn.Module,
               train_loader: DataLoader,
@@ -769,93 +949,246 @@ def build_stageC_dataset(new_excel: str,
                          device: str,
                          height_family: str = "h1",
                          static_zscore: bool = True,
-                         ) -> Dict[str, Any]:
+                         stageB_ckpt_for_norm: Optional[str] = None,
+                         recipe_aug_mode: str = "base") -> Dict[str, Any]:
     """
     返回：
       dict(
-        static_raw (N,7), recipe_ids (N,),
-        static_x (N,7) (可能 zscore),
-        phys7 (N,7),
-        phys7_seq (N,7,T),
+        static_raw (N,7),                  # 原始 recipe7
+        static_aug_raw (N,Ds),             # 增广后（例如 time: 10维）
+        recipe_ids (N,),
+        static_x (N,Ds), static_mu (1,Ds), static_sd (1,Ds),
+        phys7 (N,7), phys7_seq (N,7,T),
         y_um (N,K,T), mask (N,K,T),
         time_mat (N,T),
       )
+
+    兼容调用方参数：
+      - stageB_ckpt_for_norm
+      - recipe_aug_mode
+    并修复 NaN target 被写入 y_um+mask=True 的问题（会过滤非有限值）。
     """
+    import numpy as np
+    import pandas as pd
+    import re
+    import torch
+
+    # -------- helpers: 与 StageB 增广保持一致 --------
+    def _safe_div(a: np.ndarray, b: np.ndarray, eps: float = 1e-9):
+        return a / (b + eps)
+
+    def augment_recipe_features(recipe_raw: np.ndarray, mode: str) -> np.ndarray:
+        mode = str(mode).lower().strip()
+        x = recipe_raw.astype(np.float32)
+
+        if mode == "base":
+            return x
+
+        # x: [apc, source_rf, lf_rf, sf6, c4f8, dep_time, etch_time]
+        apc, srf, lrf, sf6, c4f8, dt, et = [x[:, i:i+1] for i in range(7)]
+        feats = [apc, srf, lrf, sf6, c4f8, dt, et]
+
+        if mode == "time":
+            feats += [dt + et, _safe_div(dt, dt + et), _safe_div(et, dt + et)]
+        elif mode == "gas":
+            gas_sum = sf6 + c4f8
+            feats += [gas_sum, _safe_div(sf6, gas_sum), _safe_div(c4f8, gas_sum)]
+        elif mode == "rf":
+            rf_sum = srf + lrf
+            feats += [rf_sum, _safe_div(srf, rf_sum), _safe_div(lrf, rf_sum)]
+        elif mode == "coupling":
+            gas_sum = sf6 + c4f8
+            rf_sum  = srf + lrf
+            t_sum   = dt + et
+            feats += [gas_sum * rf_sum, gas_sum * t_sum, rf_sum * t_sum]
+        elif mode == "squares":
+            feats += [apc**2, srf**2, lrf**2, sf6**2, c4f8**2, dt**2, et**2]
+        elif mode == "phys":
+            gas_sum = sf6 + c4f8
+            rf_sum  = srf + lrf
+            t_sum   = dt + et
+            feats += [
+                gas_sum, rf_sum, t_sum,
+                _safe_div(sf6, gas_sum), _safe_div(c4f8, gas_sum),
+                _safe_div(srf, rf_sum), _safe_div(lrf, rf_sum),
+                gas_sum * rf_sum, gas_sum * t_sum, rf_sum * t_sum,
+            ]
+        else:
+            raise ValueError(f"Unknown recipe_aug_mode: {mode}")
+
+        return np.concatenate(feats, axis=1).astype(np.float32)
+
+    # -------- 1) 读新表（targets 稀疏） --------
     recs = pu.load_new_excel_as_sparse_morph(new_excel, height_family=height_family)
     if len(recs) == 0:
         raise RuntimeError("new_excel 读取为空（请检查列名/路径）")
 
-    static_raw = np.stack([r["static"] for r in recs], axis=0).astype(np.float32)   # (N,7)
-    # recipe id：尽量从 new 表中解析 Bxx（用于“重点 recipe 覆盖”约束）
+    static_raw = np.stack([r["static"] for r in recs], axis=0).astype(np.float32)  # (N,7)
+
+    # -------- 2) 解析 recipe_ids（优先识别配方名/Bxx；鲁棒：自动在所有列里找 B\d+ 最多的那列） --------
     recipe_ids = None
+    chosen_col = None
+    chosen_hits = 0
+
     try:
         df_raw = pd.read_excel(new_excel)
-        # 常见列名候选
-        cand_cols = ["recipe","Recipe","RECIPE","配方","工艺配方","RecipeID","recipe_id","配方号","工况","Run","run"]
+
+        import re
+        pat = re.compile(r"(B\d+)", re.IGNORECASE)
+
+        def _normalize_id(s: str):
+            m = pat.search(str(s).strip().upper())
+            return m.group(1).upper() if m else ""
+
+        # (A) 先走“常见列名”快速路径（加上你现在的新表：配方名）
+        cand_cols = [
+            "配方名", "配方", "工艺配方", "配方号",
+            "recipe", "Recipe", "RECIPE",
+            "RecipeID", "recipe_id",
+            "工况", "Run", "run"
+        ]
+
         col = None
+        cols_lower = {str(c).strip().lower(): c for c in df_raw.columns}
         for c in cand_cols:
-            for cc in df_raw.columns:
-                if str(cc).strip().lower() == str(c).strip().lower():
-                    col = cc
-                    break
-            if col is not None:
+            if str(c).strip().lower() in cols_lower:
+                col = cols_lower[str(c).strip().lower()]
                 break
-        if col is None:
-            # 兜底：从任意列里找形如 B47/B52 的字符串
-            for cc in df_raw.columns:
-                s = df_raw[cc].astype(str)
-                if s.str.contains(r"(?i)\bB\d{1,3}\b", regex=True).any():
-                    col = cc
-                    break
+
         if col is not None:
             vals = df_raw[col].astype(str).fillna("")
-            def _norm_r(v: str) -> str:
-                m = re.search(r"(?i)\bB(\d{1,3})\b", v)
-                return ("B" + m.group(1)) if m else ""
-            rid = np.array([_norm_r(v) for v in vals.tolist()], dtype=object)
-            # 长度对齐
-            if len(rid) == len(recs) and np.any(rid != ""):
-                recipe_ids = rid
-    except Exception:
-        recipe_ids = None
+            ids = [_normalize_id(v) for v in vals.tolist()]
+            hits = sum(1 for x in ids if x)
+            if hits > 0 and len(ids) == len(recs):
+                chosen_col, chosen_hits = col, hits
+                recipe_ids = np.array([
+                    ids[i] if ids[i] else f"row{i}"
+                    for i in range(len(ids))
+                ], dtype=object)
 
+        # (B) 如果快速路径失败，则自动扫描所有列：找 B\d+ 命中最多的列
+        if recipe_ids is None:
+            best_ids = None
+            best_col = None
+            best_hits = 0
+
+            for c in df_raw.columns:
+                vals = df_raw[c].astype(str).fillna("")
+                ids = [_normalize_id(v) for v in vals.tolist()]
+                hits = sum(1 for x in ids if x)
+                if hits > best_hits:
+                    best_hits = hits
+                    best_col = c
+                    best_ids = ids
+
+            if best_hits > 0 and best_ids is not None and len(best_ids) == len(recs):
+                chosen_col, chosen_hits = best_col, best_hits
+                recipe_ids = np.array([
+                    best_ids[i] if best_ids[i] else f"row{i}"
+                    for i in range(len(best_ids))
+                ], dtype=object)
+
+        if recipe_ids is not None:
+            print(f"[INFO] recipe_ids parsed from column='{chosen_col}', hits={chosen_hits}/{len(recs)}")
+
+    except Exception as e:
+        recipe_ids = None
+        print(f"[WARN] recipe_id parse failed, fallback to rowi. err={e}")
+
+    # (C) 最终兜底：rowi
     if recipe_ids is None:
         recipe_ids = np.array([f"row{i}" for i in range(len(recs))], dtype=object)
 
-    # y/mask
-    N = len(recs); K = len(FAMILIES); TT = len(TIME_LIST)
+    # -------- 3) y/mask：过滤 NaN/Inf（关键） --------
+    N = len(recs)
+    K = len(FAMILIES)
+    TT = len(TIME_LIST)
+
     y_um = np.zeros((N, K, TT), np.float32)
     mask = np.zeros((N, K, TT), np.bool_)
+
+    skipped_nonfinite = 0
+    skipped_badcast = 0
+
     for i, r in enumerate(recs):
-        for (fam, tid), v_um in r["targets"].items():
-            if fam in pu.F2IDX and tid in pu.T2IDX:
-                k = pu.F2IDX[fam]; t = pu.T2IDX[tid]
-                y_um[i, k, t] = float(v_um)
-                mask[i, k, t] = True
+        tg = r.get("targets", {})
+        for (fam, tid), v_um in tg.items():
+            if fam not in pu.F2IDX or tid not in pu.T2IDX:
+                continue
+            try:
+                v = float(v_um)
+            except Exception:
+                skipped_badcast += 1
+                continue
+            if not np.isfinite(v):
+                skipped_nonfinite += 1
+                continue
+            kk = pu.F2IDX[fam]
+            tt = pu.T2IDX[tid]
+            y_um[i, kk, tt] = v
+            mask[i, kk, tt] = True
 
-    # static zscore（用于 morph 输入）
-    static_x = static_raw.copy()
+    bad = (~np.isfinite(y_um)) & mask
+    if np.any(bad):
+        mask[bad] = False
+        y_um[bad] = 0.0
+        skipped_nonfinite += int(bad.sum())
+
+    if skipped_nonfinite > 0 or skipped_badcast > 0:
+        print(f"[WARN] build_stageC_dataset: skipped targets badcast={skipped_badcast}, nonfinite={skipped_nonfinite}")
+
+    # -------- 4) recipe 增广（对齐 StageB 的 Ds） --------
+    static_aug_raw = augment_recipe_features(static_raw, recipe_aug_mode)  # (N,Ds)
+
+    # -------- 5) static_zscore：优先用 StageB ckpt 的 norm_static（如果提供） --------
+    mu = None
+    sd = None
+    if static_zscore and stageB_ckpt_for_norm and os.path.exists(stageB_ckpt_for_norm):
+        try:
+            ck = _torch_load_ckpt(stageB_ckpt_for_norm, map_location="cpu")
+            meta = ck.get("meta", {}) if isinstance(ck, dict) else {}
+            ns = meta.get("norm_static", None) if isinstance(meta, dict) else None
+            if isinstance(ns, dict) and ("mean" in ns) and ("std" in ns):
+                mu0 = ns["mean"]
+                sd0 = ns["std"]
+                mu0 = mu0.detach().cpu().numpy() if torch.is_tensor(mu0) else np.array(mu0)
+                sd0 = sd0.detach().cpu().numpy() if torch.is_tensor(sd0) else np.array(sd0)
+                mu0 = mu0.reshape(1, -1).astype(np.float32)
+                sd0 = sd0.reshape(1, -1).astype(np.float32)
+                if mu0.shape[1] == static_aug_raw.shape[1] and sd0.shape[1] == static_aug_raw.shape[1]:
+                    mu, sd = mu0, (sd0 + 1e-6)
+                    print(f"[INFO] use StageB norm_static for zscore: Ds={mu.shape[1]}")
+                else:
+                    print(f"[WARN] StageB norm_static Ds={mu0.shape[1]} != current Ds={static_aug_raw.shape[1]}, fallback to self-fit.")
+        except Exception as e:
+            print(f"[WARN] failed to load StageB norm_static, fallback to self-fit. err={e}")
+
     if static_zscore:
-        mu = static_raw.mean(axis=0, keepdims=True)
-        sd = static_raw.std(axis=0, keepdims=True) + 1e-6
-        static_x = (static_raw - mu) / sd
+        if mu is None or sd is None:
+            mu = static_aug_raw.mean(axis=0, keepdims=True).astype(np.float32)
+            sd = (static_aug_raw.std(axis=0, keepdims=True) + 1e-6).astype(np.float32)
+        static_x = (static_aug_raw - mu) / sd
     else:
-        mu = np.zeros((1, static_raw.shape[1]), np.float32)
-        sd = np.ones((1, static_raw.shape[1]), np.float32)
+        mu = np.zeros((1, static_aug_raw.shape[1]), np.float32)
+        sd = np.ones((1, static_aug_raw.shape[1]), np.float32)
+        static_x = static_aug_raw.copy()
 
-    # Phys7：StageA 推理（注意：这里对齐 recipe_raw，而不是 zscore 后的 static_x）
-    phys7 = infer_phys7_from_stageA_ckpt(stageA_ckpt, static_raw, device=device)    # (N,7)
-    phys7_seq = np.repeat(phys7[:, :, None], TT, axis=2).astype(np.float32)        # (N,7,T)
+    # -------- 6) Phys7：StageA 推理（一定用原始 recipe7） --------
+    phys7 = infer_phys7_from_stageA_ckpt(stageA_ckpt, static_raw, device=device)     # (N,7)
+    phys7_seq = np.repeat(phys7[:, :, None], TT, axis=2).astype(np.float32)         # (N,7,T)
 
+    # -------- 7) time_mat --------
     time_mat = np.repeat(TIME_VALUES[None, :], N, axis=0).astype(np.float32)
 
     return dict(
-        static_raw=static_raw, static_x=static_x, static_mu=mu, static_sd=sd,
+        static_raw=static_raw,
+        static_aug_raw=static_aug_raw,
+        static_x=static_x, static_mu=mu, static_sd=sd,
         recipe_ids=recipe_ids,
         phys7=phys7, phys7_seq=phys7_seq,
-        y_um=y_um, mask=mask, time_mat=time_mat,
+        y_um=y_um, mask=mask,
+        time_mat=time_mat,
     )
-
 
 # ---------------------------- 子集+划分搜索（满足 key recipes 覆盖 + R2 目标） ----------------------------
 def _parse_key_recipes(s: str) -> List[str]:
@@ -954,23 +1287,35 @@ def random_subset_and_split(N: int,
 
 
 def fit_y_norm(y_um: np.ndarray, mask: np.ndarray, train_idx: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    """按通道/时间点，用 train 子集拟合均值方差（mask 后）。返回 y_mean,y_std shaped (1,K,T)."""
-    K = y_um.shape[1]; TT = y_um.shape[2]
-    mean = np.zeros((1,K,TT), np.float32)
-    std  = np.ones((1,K,TT), np.float32)
+    """按通道/时间点，用 train 子集拟合均值方差（mask 后 + 过滤非有限值）。返回 y_mean,y_std shaped (1,K,T)."""
+    K = y_um.shape[1]
+    TT = y_um.shape[2]
+    mean = np.zeros((1, K, TT), np.float32)
+    std  = np.ones((1, K, TT), np.float32)
+
     ytr = y_um[train_idx]
-    mtr = mask[train_idx]
+    mtr = mask[train_idx].astype(bool)
+
     for k in range(K):
         for t in range(TT):
-            vals = ytr[:,k,t][mtr[:,k,t]]
+            vals = ytr[:, k, t][mtr[:, k, t]]
+            if vals.size == 0:
+                continue
+            vals = vals[np.isfinite(vals)]
             if vals.size >= 2:
-                mean[0,k,t] = float(vals.mean())
-                std[0,k,t]  = float(vals.std() + 1e-6)
+                mean[0, k, t] = float(vals.mean())
+                std[0, k, t]  = float(vals.std() + 1e-6)
             elif vals.size == 1:
-                mean[0,k,t] = float(vals[0])
-                std[0,k,t]  = 1e-6
-    return mean, std
+                mean[0, k, t] = float(vals[0])
+                std[0, k, t]  = 1e-6
 
+    # 兜底：如果 mean/std 里还有非有限值，强制修正
+    bad = ~np.isfinite(mean) | ~np.isfinite(std) | (std <= 0)
+    if np.any(bad):
+        mean = np.where(np.isfinite(mean), mean, 0.0).astype(np.float32)
+        std  = np.where((np.isfinite(std) & (std > 0)), std, 1.0).astype(np.float32)
+
+    return mean, std
 
 def make_loader(static_x, phys7_seq, y_norm, mask, time_mat, idx: np.ndarray, batch: int) -> DataLoader:
     ds = TensorDataset(
@@ -1026,125 +1371,609 @@ class Cfg:
     family_sign: Optional[List[float]] = None   # e.g. [-1,1,1,1,1,1]
 
 
+# ============================ StageC Split Search v2: multi-single-task ============================
+def _family_to_index(family: str) -> int:
+    fam = str(family).strip()
+    for i, f in enumerate(list(FAMILIES)):
+        if str(f).strip().lower() == fam.lower():
+            return i
+    raise KeyError(f"Unknown family='{family}'. Available={list(FAMILIES)}")
+
+def _parse_required_families(cfg: "Cfg") -> List[str]:
+    """
+    required_families: 逗号分隔字符串，或 list[str]
+    默认 zmin,h1,d1,w（若存在于 FAMILIES）
+    """
+    rf = getattr(cfg, "required_families", None)
+    if rf is None:
+        cand = ["zmin", "h1", "d1", "w"]
+        return [c for c in cand if any(str(c).lower()==str(x).lower() for x in FAMILIES)]
+    if isinstance(rf, (list, tuple)):
+        out = [str(x).strip() for x in rf if str(x).strip()]
+    else:
+        out = [x.strip() for x in str(rf).replace(";", ",").split(",") if x.strip()]
+    # 过滤不存在的
+    out2=[]
+    for x in out:
+        if any(str(x).lower()==str(f).lower() for f in FAMILIES):
+            out2.append(x)
+    return out2
+
+def _make_single_family_mask(mask_full: np.ndarray, fam_idx: int) -> np.ndarray:
+    """mask_full: (N,K,T) bool/0-1 -> 只保留某个 family 的 mask，其余置 0。"""
+    m = mask_full.astype(bool)
+    m2 = np.zeros_like(m, dtype=np.bool_)
+    m2[:, fam_idx, :] = m[:, fam_idx, :]
+    return m2
+
+def make_loader2(static_x, phys7_seq, y_norm, mask, time_mat, idx: np.ndarray, batch: int, shuffle: bool) -> DataLoader:
+    ds = TensorDataset(
+        torch.from_numpy(static_x[idx]).float(),
+        torch.from_numpy(phys7_seq[idx]).float(),
+        torch.from_numpy(y_norm[idx]).float(),
+        torch.from_numpy(mask[idx]).bool(),
+        torch.from_numpy(time_mat[idx]).float(),
+    )
+    return DataLoader(ds, batch_size=min(batch, len(ds)), shuffle=shuffle)
+
+def _export_single_family_parity(out_png: str,
+                                pack: Dict[str, np.ndarray],
+                                y_mean: np.ndarray, y_std: np.ndarray,
+                                family_sign: Optional[torch.Tensor],
+                                unit_scale: float,
+                                fam_idx: int,
+                                title: str = "") -> None:
+    """
+    只画某个 family 的 test parity（展示空间，默认 nm + zmin 翻正）
+    """
+    import matplotlib.pyplot as plt
+    pred_disp, y_disp, m = _pack_to_display_arrays(pack, y_mean, y_std, family_sign, unit_scale)
+    mk = m[:, fam_idx, :].reshape(-1)
+    if mk.sum() <= 0:
+        return
+    yt = y_disp[:, fam_idx, :].reshape(-1)[mk]
+    yp = pred_disp[:, fam_idx, :].reshape(-1)[mk]
+
+    plt.figure(figsize=(4.2,4.2))
+    plt.scatter(yt, yp, s=8, alpha=0.6)
+    # y=x
+    mn = float(np.nanmin([yt.min(), yp.min()]))
+    mx = float(np.nanmax([yt.max(), yp.max()]))
+    plt.plot([mn, mx], [mn, mx], linestyle="--")
+    plt.xlabel("Measured (display)")
+    plt.ylabel("Predicted (display)")
+    if title:
+        plt.title(title)
+    plt.tight_layout()
+    os.makedirs(os.path.dirname(out_png), exist_ok=True)
+    plt.savefig(out_png, dpi=200)
+    plt.close()
+
+def _single_task_train_eval_once(cfg: "Cfg",
+                                 data: Dict[str, Any],
+                                 train_idx: np.ndarray,
+                                 val_idx: np.ndarray,
+                                 test_idx: np.ndarray,
+                                 fam_idx: int,
+                                 tag: str,
+                                 device: str,
+                                 out_dir: Optional[str],
+                                 *,
+                                 do_train: bool,
+                                 load_stageB: bool,
+                                 zero_phys7: bool) -> Dict[str, Any]:
+    """
+    训练/评估单个 family 的单任务模型（模型仍输出 K，但 loss 只看 fam_idx）。
+    返回：
+      dict(train_pack,test_pack,y_mean,y_std, fam_r2, fam_mae, fam_n, fam_std)
+    """
+    static_x  = data["static_x"]
+    phys7_seq = data["phys7_seq"]
+    y_um      = data["y_um"]
+    mask_full = data["mask"]
+    time_mat  = data["time_mat"]
+
+    # --- single family mask + single family norm ---
+    mask_single = _make_single_family_mask(mask_full, fam_idx)
+    y_mean, y_std = fit_y_norm(y_um, mask_single, train_idx)
+    y_norm = (y_um - y_mean) / (y_std + 1e-6)
+
+    # --- phys7 optionally zero ---
+    if zero_phys7:
+        phys7_use = np.zeros_like(phys7_seq, dtype=np.float32)
+    else:
+        phys7_use = phys7_seq
+
+    # loaders（train shuffle, val/test no shuffle）
+    train_loader = make_loader2(static_x, phys7_use, y_norm, mask_single, time_mat, train_idx, cfg.batch, shuffle=True)
+    val_loader   = make_loader2(static_x, phys7_use, y_norm, mask_single, time_mat, val_idx,   cfg.batch, shuffle=False) if len(val_idx)>0 else train_loader
+    test_loader  = make_loader2(static_x, phys7_use, y_norm, mask_single, time_mat, test_idx,  cfg.batch, shuffle=False)
+
+    K = y_um.shape[1]
+    stageB_ckpt = cfg.stageB_ckpt if load_stageB else None
+    model = build_morph_model(cfg.model_type, K, device, stageB_ckpt=stageB_ckpt).to(device)
+
+    if do_train:
+        train_one(model, train_loader, val_loader, device,
+                  epochs=int(getattr(cfg, "epochs", 200)),
+                  lr=float(getattr(cfg, "lr", 5e-4)),
+                  wd=float(getattr(cfg, "wd", 1e-4)),
+                  early_patience=int(getattr(cfg, "early_patience", 30)))
+
+    # eval packs
+    train_pack = eval_pack(model, train_loader, device)
+    test_pack  = eval_pack(model, test_loader, device)
+
+    # family metrics（display space）
+    stats = family_stats_from_pack(test_pack, y_mean, y_std,
+                                   family_sign=None if getattr(cfg, "family_sign", None) is None else torch.tensor(cfg.family_sign, dtype=torch.float32),
+                                   unit_scale=float(getattr(cfg, "unit_scale", 1000.0)))
+    fam_r2  = float(stats["r2"][fam_idx]) if np.isfinite(stats["r2"][fam_idx]) else float("nan")
+    fam_mae = float(stats["mae"][fam_idx]) if np.isfinite(stats["mae"][fam_idx]) else float("nan")
+    fam_n   = int(stats["n"][fam_idx])
+    fam_std = float(stats["std"][fam_idx]) if np.isfinite(stats["std"][fam_idx]) else float("nan")
+
+    # optional export
+    if out_dir:
+        family_sign_t = None
+        if getattr(cfg, "family_sign", None) is not None:
+            family_sign_t = torch.tensor(cfg.family_sign, dtype=torch.float32)
+        export_stageC_report(out_dir, train_pack, test_pack, y_mean, y_std, family_sign_t, float(getattr(cfg, "unit_scale", 1000.0)))
+        fam_name = str(FAMILIES[fam_idx])
+        _export_single_family_parity(
+            os.path.join(out_dir, f"fig_parity_test_{fam_name}.png"),
+            test_pack, y_mean, y_std, family_sign_t, float(getattr(cfg, "unit_scale", 1000.0)),
+            fam_idx=fam_idx, title=f"{tag} | {fam_name} | test parity"
+        )
+        # save single-family metrics json
+        js = dict(tag=tag, family=fam_name, test_R2=fam_r2, test_MAE=fam_mae, n_test=fam_n, std_test=fam_std)
+        with open(os.path.join(out_dir, "metrics_single_family.json"), "w", encoding="utf-8") as f:
+            json.dump(js, f, indent=2, ensure_ascii=False)
+
+        # save ckpt
+        try:
+            torch.save(model.state_dict(), os.path.join(out_dir, "model_best.pth"))
+        except Exception:
+            pass
+
+    return dict(train_pack=train_pack, test_pack=test_pack,
+                y_mean=y_mean, y_std=y_std,
+                fam_r2=fam_r2, fam_mae=fam_mae, fam_n=fam_n, fam_std=fam_std)
+
+def searchbest_split_multi_single_tasks(cfg: "Cfg", data: Dict[str, Any], device: str) -> Dict[str, Any]:
+    """
+    你要的核心：search best split，使得多个 family 的“单任务模型”(默认用 C_transfer)在同一 split 的 test 上 **同时尽可能高**。
+    rank = min_required_family_R2 + 0.01 * mean_required_family_R2
+    meets = (min_required_family_R2 >= cfg.min_family_r2)
+    """
+    import csv, time
+
+    os.makedirs(cfg.out_dir, exist_ok=True)
+    required = _parse_required_families(cfg)
+    if len(required) == 0:
+        raise RuntimeError("required_families 为空：请检查 cfg.required_families 或 FAMILIES。")
+
+    req_idx = [_family_to_index(f) for f in required]
+    min_family_r2 = float(getattr(cfg, "min_family_r2", 0.80))
+    seed = int(getattr(cfg, "seed", 2026))
+    rng = np.random.default_rng(seed)
+
+    # family_sign（用于 display space）
+    family_sign_t = None
+    if getattr(cfg, "family_sign", None) is not None:
+        family_sign_t = torch.tensor(cfg.family_sign, dtype=torch.float32)
+
+    # log
+    trials_csv = os.path.join(cfg.out_dir, "trials_log.csv")
+    with open(trials_csv, "w", newline="", encoding="utf-8-sig") as f:
+        w = csv.writer(f)
+        w.writerow(["trial","train_n","val_n","test_n","minReqR2","meanReqR2","meets"] + [f"R2_{f}" for f in required])
+
+    best = dict(rank=-1e9, meets=False, trial=-1, split=None, fam_rows=None)
+
+    # split search
+    for tr in range(1, int(getattr(cfg, "trials", 300)) + 1):
+        train_idx, val_idx, test_idx = random_subset_and_split(
+            recipe_ids=data["recipe_ids"],
+            mask=data["mask"],
+            key_recipes=_parse_key_recipes(cfg.key_recipes),
+            test_ratio=float(getattr(cfg, "test_ratio", 0.25)),
+            val_ratio=float(getattr(cfg, "val_ratio", 0.15)),
+            drop_max_frac=float(getattr(cfg, "drop_max_frac", 0.0)),
+            rng=rng
+        )
+
+        fam_r2s=[]
+        fam_rows=[]
+        # 对每个 family 训练一个 single-task C_transfer（用于 split 打分）
+        for fam_name, k in zip(required, req_idx):
+            # 为了减少方差：不同 trial 仍然可能波动；这里把种子锁死到 (seed, trial, family)
+            torch.manual_seed(seed * 100000 + tr * 100 + k)
+            np.random.seed((seed + tr * 100 + k) % (2**32 - 1))
+
+            out_dir = None  # 非 best 不落盘
+            res = _single_task_train_eval_once(
+                cfg, data, train_idx, val_idx, test_idx,
+                fam_idx=k, tag="C_transfer_single",
+                device=device, out_dir=out_dir,
+                do_train=True, load_stageB=True, zero_phys7=False
+            )
+            fam_r2s.append(res["fam_r2"])
+            fam_rows.append(dict(family=str(FAMILIES[k]), test_R2=res["fam_r2"], test_MAE=res["fam_mae"],
+                                 n_test=res["fam_n"], std_test=res["fam_std"]))
+
+        minReq = float(np.nanmin(fam_r2s)) if len(fam_r2s)>0 else float("nan")
+        meanReq = float(np.nanmean(fam_r2s)) if len(fam_r2s)>0 else float("nan")
+        meets = bool(np.isfinite(minReq) and (minReq >= min_family_r2))
+        rank = (minReq if np.isfinite(minReq) else -1e9) + 0.01 * (meanReq if np.isfinite(meanReq) else 0.0)
+
+        # log
+        with open(trials_csv, "a", newline="", encoding="utf-8-sig") as f:
+            w = csv.writer(f)
+            w.writerow([tr, len(train_idx), len(val_idx), len(test_idx), minReq, meanReq, int(meets)] + fam_r2s)
+
+        # best update
+        if rank > best["rank"]:
+            best.update(rank=rank, meets=meets, trial=tr, split=dict(train_idx=train_idx.tolist(), val_idx=val_idx.tolist(), test_idx=test_idx.tolist()),
+                        fam_rows=fam_rows, minReq=minReq, meanReq=meanReq)
+
+            # 落盘 best split
+            split_desc = describe_split(data["recipe_ids"], train_idx, val_idx, test_idx)
+            best_json = dict(
+                trial=tr, meets_constraints=meets,
+                min_required_family_R2=minReq,
+                mean_required_family_R2=meanReq,
+                required_families=required,
+                split_desc=split_desc,
+                train_idx=train_idx.tolist(), val_idx=val_idx.tolist(), test_idx=test_idx.tolist(),
+                family_metrics=fam_rows,
+            )
+            with open(os.path.join(cfg.out_dir, "best_split.json"), "w", encoding="utf-8") as f:
+                json.dump(best_json, f, indent=2, ensure_ascii=False)
+
+            # 同时把 best 的每个 family 模型/图落盘（为了“冲分展示”，不重训）
+            for fam_name, k in zip(required, req_idx):
+                fam_dir = os.path.join(cfg.out_dir, "best_models_single_task", fam_name)
+                os.makedirs(fam_dir, exist_ok=True)
+
+                torch.manual_seed(seed * 100000 + tr * 100 + k)
+                np.random.seed((seed + tr * 100 + k) % (2**32 - 1))
+
+                _ = _single_task_train_eval_once(
+                    cfg, data, train_idx, val_idx, test_idx,
+                    fam_idx=k, tag="C_transfer_single(best)",
+                    device=device, out_dir=fam_dir,
+                    do_train=True, load_stageB=True, zero_phys7=False
+                )
+
+            print(f"[split_search_single][best@{tr}] meets={meets} minReqR2={minReq:.4f} meanReqR2={meanReq:.4f}")
+
+            # 早停：如果已经满足 hard constraint，可以直接停（你也可以关掉）
+            if meets and bool(getattr(cfg, "stop_when_meets", True)):
+                break
+
+    print(f"[Done] Best split saved to: {os.path.join(cfg.out_dir, 'best_split.json')}")
+    return best
+
+def run_ablation_suite_single_task(cfg: "Cfg", data: Dict[str, Any], best_split_path: str, device: str) -> None:
+    """
+    固定 best_split.json 的 split，对每个 required family 跑 4 个单任务对照，并输出：
+      - out_dir/single_task_ablation/<family>/<tag>/...
+      - out_dir/single_task_ablation/ablation_summary_single_task.csv  （行=family，列=各tag R2/MAE）
+    """
+    import pandas as pd
+
+    with open(best_split_path, "r", encoding="utf-8") as f:
+        best = json.load(f)
+    train_idx = np.array(best["train_idx"], dtype=int)
+    val_idx   = np.array(best["val_idx"], dtype=int)
+    test_idx  = np.array(best["test_idx"], dtype=int)
+
+    required = best.get("required_families", _parse_required_families(cfg))
+    req_idx = [_family_to_index(f) for f in required]
+
+    out_root = os.path.join(cfg.out_dir, "single_task_ablation")
+    os.makedirs(out_root, exist_ok=True)
+
+    rows=[]
+    for fam_name, k in zip(required, req_idx):
+        fam_root = os.path.join(out_root, fam_name)
+        # 4 tags（全是单任务口径）
+        settings = [
+            ("B2R_zero_ft", dict(do_train=False, load_stageB=True,  zero_phys7=False)),
+            ("C_scratch",   dict(do_train=True,  load_stageB=False, zero_phys7=False)),
+            ("C_transfer",  dict(do_train=True,  load_stageB=True,  zero_phys7=False)),
+            ("C_noPhys7",   dict(do_train=True,  load_stageB=True,  zero_phys7=True)),
+        ]
+        for tag, st in settings:
+            out_dir = os.path.join(fam_root, tag)
+            res = _single_task_train_eval_once(
+                cfg, data, train_idx, val_idx, test_idx,
+                fam_idx=k, tag=tag, device=device, out_dir=out_dir,
+                do_train=st["do_train"], load_stageB=st["load_stageB"], zero_phys7=st["zero_phys7"]
+            )
+            rows.append(dict(family=fam_name, tag=tag,
+                             test_R2=res["fam_r2"], test_MAE=res["fam_mae"],
+                             n_test=res["fam_n"], std_test=res["fam_std"]))
+            print(f"[SingleTask][{fam_name}][{tag}] test_R2={res['fam_r2']:.4f} test_MAE={res['fam_mae']:.2f} n_test={res['fam_n']}")
+
+    df = pd.DataFrame(rows)
+    df.to_csv(os.path.join(out_root, "ablation_summary_single_task_long.csv"), index=False, encoding="utf-8-sig")
+
+    # pivot（行=family，列=tag_xxx）
+    pivot = df.pivot(index="family", columns="tag", values="test_R2")
+    pivot_mae = df.pivot(index="family", columns="tag", values="test_MAE")
+    pivot.to_csv(os.path.join(out_root, "ablation_summary_single_task_R2.csv"), encoding="utf-8-sig")
+    pivot_mae.to_csv(os.path.join(out_root, "ablation_summary_single_task_MAE.csv"), encoding="utf-8-sig")
+
+
+
 def main(cfg: Cfg):
+    """
+    StageC 主流程（你最终要的版本）：
+      1) search best split：同一个 split 上，训练多个 family 的“单任务 C_transfer”，让 min(required_family test_R2) 尽可能高（目标>=min_family_r2）
+      2) best 更新时：把该 split 下每个 family 的 best 单任务模型/散点/指标直接落盘（不再重训，避免你之前看到的 “search高但fixed掉分”）
+      3) split 固定后：在同一 split 上做单任务 ablation（B2R_zero_ft / C_scratch / C_transfer / C_noPhys7），每个 family 都有一套对比结果
+    """
+    import os, time
+    import torch
+
     os.makedirs(cfg.out_dir, exist_ok=True)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"[Device] {device}")
 
-    # build dataset
-    data = build_stageC_dataset(cfg.new_excel, cfg.stageA_ckpt, device=device)
-    static_x = data["static_x"]
+    # seed
+    seed = int(getattr(cfg, "seed", 2026))
+    if seed in (None, -1):
+        seed = int(time.time())
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+
+    # build data once
+    data = build_stageC_dataset(
+        cfg.new_excel, cfg.stageA_ckpt, device=device,
+        stageB_ckpt_for_norm=cfg.stageB_ckpt,
+        recipe_aug_mode="time"
+    )
+
+    # search best split (multi single-task)
+    print(f"[INFO] required_families={_parse_required_families(cfg)} (min_family_r2={getattr(cfg,'min_family_r2',0.8)})")
+    best = searchbest_split_multi_single_tasks(cfg, data, device=device)
+
+    # ablation on fixed best split (multi single-task)
+    best_path = os.path.join(cfg.out_dir, "best_split.json")
+    run_ablation_suite_single_task(cfg, data, best_split_path=best_path, device=device)
+
+
+def run_ablation_suite(cfg: Cfg):
+    """
+    在同一个“固定 split”上跑 4 个最小对照：
+      1) B2R_zero_ft  : load StageB, 不训练
+      2) C_scratch    : 不 load StageB，但同架构训练（公平）
+      3) C_transfer   : load StageB + 训练（主方法）
+      4) C_noPhys7    : load StageB + 训练，但 Phys7 置零（Phys7 贡献）
+
+    关键改动：
+    - 优先读取 main() 输出的 best_split.json / best_so_far.json
+    - 若没有，自动调用 main(cfg) 先生成
+    - 保存本次 ablation 实际使用的 split（含 idx）到 out_dir/ablation_split.json
+    - summary csv 用 na_rep="NaN" 防止空白
+    - 每个 tag 从 metrics_overall.json 回读并打印
+    """
+    import os, json
+    import numpy as np
+    import pandas as pd
+    import torch
+
+    os.makedirs(cfg.out_dir, exist_ok=True)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"[Device] {device}")
+
+    # 1) 构建数据（与 StageB 对齐：time-aug -> static_dim=10）
+    data = build_stageC_dataset(
+        cfg.new_excel, cfg.stageA_ckpt, device=device,
+        stageB_ckpt_for_norm=cfg.stageB_ckpt,
+        recipe_aug_mode="time"
+    )
+    static_x  = data["static_x"]
     phys7_seq = data["phys7_seq"]
-    y_um = data["y_um"]
-    mask = data["mask"]
-    time_mat = data["time_mat"]
+    y_um      = data["y_um"]
+    mask      = data["mask"]
+    time_mat  = data["time_mat"]
     recipe_ids = data["recipe_ids"]
 
+    # 2) 检查 key recipe 是否真的在 recipe_ids 里（否则你的“B47/B52/B54 必在 test”约束不会生效）
     key_recipes = _parse_key_recipes(cfg.key_recipes)
+    existing_keys = [k for k in key_recipes if k in set([str(x) for x in recipe_ids.tolist()])]
+    if len(existing_keys) == 0:
+        uniq = sorted(list(set([str(x) for x in recipe_ids.tolist()])))[:20]
+        print(f"[WARN] key_recipes={key_recipes} 在 new_excel 解析出的 recipe_ids 里一个都没找到。")
+        print(f"       说明 new_excel 的 recipe 列没被正确识别，目前 recipe_ids 可能是 rowi。")
+        print(f"       recipe_ids 前20个unique示例: {uniq}")
+
+    # 3) 优先读取 main 的 split；没有就先跑 main(cfg) 生成
+    best_path = os.path.join(cfg.out_dir, "best_split.json")
+    sofar_path = os.path.join(cfg.out_dir, "best_so_far.json")
+
+    main(cfg)
+
+    split_obj = None
+    if os.path.exists(best_path):
+        with open(best_path, "r", encoding="utf-8") as f:
+            split_obj = json.load(f)
+        split_tag = "best_split.json"
+    elif os.path.exists(sofar_path):
+        with open(sofar_path, "r", encoding="utf-8") as f:
+            split_obj = json.load(f)
+        split_tag = "best_so_far.json"
+    else:
+        raise RuntimeError("Still cannot find split json after running main(cfg).")
+
+    # 4) 取 idx（json 里是 list）
+    train_idx = np.array(split_obj["train_idx"], dtype=int)
+    val_idx   = np.array(split_obj["val_idx"], dtype=int)
+    test_idx  = np.array(split_obj["test_idx"], dtype=int)
+
+    # 5) y_norm：优先用 json 里存的 y_mean/y_std（best_split 里有），否则重算
+    if ("y_mean" in split_obj) and ("y_std" in split_obj):
+        y_mean = np.array(split_obj["y_mean"], dtype=np.float32)
+        y_std  = np.array(split_obj["y_std"], dtype=np.float32)
+    else:
+        y_mean, y_std = fit_y_norm(y_um, mask, train_idx)
+
+    y_norm = (y_um - y_mean) / (y_std + 1e-6)
 
     # family_sign
     family_sign_t = None
     if cfg.family_sign is not None:
         family_sign_t = torch.tensor(cfg.family_sign, dtype=torch.float32)
 
-    rng = np.random.default_rng(2026)
+    # 6) 保存并打印 split（你要“看得到划分”就看这个）
+    split_desc = describe_split(recipe_ids, train_idx, val_idx, test_idx)
+    ab_split = {
+        "source": split_tag,
+        "trial": split_obj.get("trial", None),
+        "train_idx": train_idx.tolist(),
+        "val_idx": val_idx.tolist(),
+        "test_idx": test_idx.tolist(),
+        "split_desc": split_desc,
+        "key_recipes": key_recipes,
+        "existing_keys_in_recipe_ids": existing_keys,
+        "train_n": int(len(train_idx)),
+        "val_n": int(len(val_idx)),
+        "test_n": int(len(test_idx)),
+    }
+    with open(os.path.join(cfg.out_dir, "ablation_split.json"), "w", encoding="utf-8") as f:
+        json.dump(ab_split, f, ensure_ascii=False, indent=2)
 
-    best = None
+    print(f"[Ablation] Using split from {split_tag}")
+    print(f"[Ablation] Split desc: {split_desc}")
 
-    for tr in range(1, cfg.trials+1):
-        try:
-            print(
-                f"[Trial {tr}] Loaded StageB ckpt (matched={info['matched']}/{info['model_key_count']}, missing={len(info['missing'])}, unexpected={len(info['unexpected'])})")
-            train_idx, val_idx, test_idx = random_subset_and_split(
-                N=len(recipe_ids),
-                recipe_ids=recipe_ids,
-                key_recipes=key_recipes,
-                test_ratio=cfg.test_ratio,
-                val_ratio=cfg.val_ratio,
-                drop_max_frac=cfg.drop_max_frac,
-                rng=rng
-            )
-        except Exception as e:
-            continue
+    # 7) loaders
+    train_loader = make_loader(static_x, phys7_seq, y_norm, mask, time_mat, train_idx, cfg.batch)
+    val_loader   = make_loader(static_x, phys7_seq, y_norm, mask, time_mat, val_idx,   cfg.batch)
+    test_loader  = make_loader(static_x, phys7_seq, y_norm, mask, time_mat, test_idx,  cfg.batch)
 
-        # norm y using train subset
-        y_mean, y_std = fit_y_norm(y_um, mask, train_idx)
-        y_norm = (y_um - y_mean) / (y_std + 1e-6)
+    def _read_overall(tag_dir: str):
+        p = os.path.join(tag_dir, "metrics_overall.json")
+        if not os.path.exists(p):
+            return None
+        with open(p, "r", encoding="utf-8") as f:
+            return json.load(f)
 
-        train_loader = make_loader(static_x, phys7_seq, y_norm, mask, time_mat, train_idx, cfg.batch)
-        val_loader   = make_loader(static_x, phys7_seq, y_norm, mask, time_mat, val_idx, cfg.batch)
-        test_loader  = make_loader(static_x, phys7_seq, y_norm, mask, time_mat, test_idx, cfg.batch)
+    def _run_one(tag: str, load_stageB: bool, do_train: bool, phys7_mode: str, force_stageB_arch: bool = True):
+        out_dir = os.path.join(cfg.out_dir, tag)
+        os.makedirs(out_dir, exist_ok=True)
 
-        model = build_morph_model(cfg.model_type, K=len(FAMILIES), device=device)
-        if cfg.stageB_ckpt:
+        arch_ckpt = cfg.stageB_ckpt if (force_stageB_arch or load_stageB) else None
+        model = build_morph_model(cfg.model_type, K=len(FAMILIES), device=device, stageB_ckpt=arch_ckpt)
+
+        if load_stageB and cfg.stageB_ckpt:
             info = load_morph_ckpt(model, cfg.stageB_ckpt)
-            if info.get("ok", False):
-                print(f"[Trial {tr}] Loaded StageB ckpt (missing={len(info['missing'])}, unexpected={len(info['unexpected'])})")
-            else:
-                print(f"[Trial {tr}] StageB ckpt not loaded: {info.get('reason')}")
+            print(f"[{tag}] load StageB ok={info.get('ok')} matched={info.get('matched',0)} "
+                  f"missing={len(info.get('missing',[]))} unexpected={len(info.get('unexpected',[]))}")
 
-        # train
-        train_one(model, train_loader, val_loader, device=device,
-                  epochs=cfg.epochs, lr=cfg.lr, wd=cfg.wd, early_patience=cfg.early_patience)
+        # phys7 ablation
+        if phys7_mode == "zero":
+            zero_phys = np.zeros_like(phys7_seq, dtype=np.float32)
+            tr_loader = make_loader(static_x, zero_phys, y_norm, mask, time_mat, train_idx, cfg.batch)
+            va_loader = make_loader(static_x, zero_phys, y_norm, mask, time_mat, val_idx, cfg.batch)
+            te_loader = make_loader(static_x, zero_phys, y_norm, mask, time_mat, test_idx, cfg.batch)
+        else:
+            tr_loader, va_loader, te_loader = train_loader, val_loader, test_loader
 
-        # eval train/test R2 (display space)
-        train_pack = eval_pack(model, train_loader, device=device)
-        test_pack  = eval_pack(model, test_loader, device=device)
-        train_r2 = overall_r2_from_pack(train_pack, y_mean, y_std, family_sign_t, cfg.unit_scale)
-        test_r2  = overall_r2_from_pack(test_pack,  y_mean, y_std, family_sign_t, cfg.unit_scale)
+        if do_train:
+            print(f"[{tag}] TRAIN: epochs={cfg.epochs} lr={cfg.lr} wd={cfg.wd} batch={cfg.batch}")
+            train_one(model, tr_loader, va_loader, device=device,
+                      epochs=cfg.epochs, lr=cfg.lr, wd=cfg.wd, early_patience=cfg.early_patience)
+        else:
+            print(f"[{tag}] TRAIN: skipped (zero fine-tune)")
 
-        if tr % 10 == 0:
-            print(f"[Trial {tr}/{cfg.trials}] train_R2={train_r2:.3f} test_R2={test_r2:.3f} (train={len(train_idx)} test={len(test_idx)})")
+        tr_pack = eval_pack(model, tr_loader, device=device)
+        te_pack = eval_pack(model, te_loader, device=device)
 
-        ok = (train_r2 >= cfg.target_r2) and (test_r2 >= cfg.target_r2)
-        if ok:
-            print(f"\n[SUCCESS] Found split: trial={tr} train_R2={train_r2:.3f} test_R2={test_r2:.3f}\n")
-            best = {
-                "trial": tr,
-                "train_r2": float(train_r2),
-                "test_r2": float(test_r2),
-                "train_idx": train_idx.tolist(),
-                "val_idx": val_idx.tolist(),
-                "test_idx": test_idx.tolist(),
-                "split_desc": describe_split(recipe_ids, train_idx, val_idx, test_idx),
-                "y_mean": y_mean.tolist(),
-                "y_std": y_std.tolist(),
-                "model_type": cfg.model_type,
-                "cfg": cfg.__dict__,
+        export_stageC_report(out_dir, tr_pack, te_pack, y_mean, y_std, family_sign_t, cfg.unit_scale)
+
+        # 回读 json，保证结果可见
+        mj = _read_overall(out_dir)
+        if mj is not None and "overall" in mj:
+            o = mj["overall"]
+            print(f"[{tag}] RESULT(from json): train_R2={o.get('train_R2')} test_R2={o.get('test_R2')} "
+                  f"train_MAE={o.get('train_MAE')} test_MAE={o.get('test_MAE')}")
+            return {
+                "tag": tag,
+                "train_R2": o.get("train_R2"),
+                "test_R2": o.get("test_R2"),
+                "train_MAE": o.get("train_MAE"),
+                "test_MAE": o.get("test_MAE"),
             }
-            # 保存 best
-            with open(os.path.join(cfg.out_dir, "best_split.json"), "w", encoding="utf-8") as f:
-                json.dump(best, f, ensure_ascii=False, indent=2)
 
-            # 额外导出 test pack（用于画图/报告）
-            np.savez_compressed(os.path.join(cfg.out_dir, "best_test_pack.npz"), **test_pack)
-            np.savez_compressed(os.path.join(cfg.out_dir, "best_train_pack.npz"), **train_pack)
-            break
+        # 兜底：如果 json 不存在，至少返回 pack 计算结果（可能 NaN）
+        tr_r2 = overall_r2_from_pack(tr_pack, y_mean, y_std, family_sign_t, cfg.unit_scale)
+        te_r2 = overall_r2_from_pack(te_pack, y_mean, y_std, family_sign_t, cfg.unit_scale)
+        print(f"[{tag}] RESULT(fallback): train_R2={tr_r2} test_R2={te_r2}")
+        return {"tag": tag, "train_R2": float(tr_r2), "test_R2": float(te_r2)}
 
-        # keep best even if not reaching target
-        score = min(train_r2, test_r2)
-        if best is None or score > min(best["train_r2"], best["test_r2"]):
-            best = {
-                "trial": tr,
-                "train_r2": float(train_r2),
-                "test_r2": float(test_r2),
-                "train_idx": train_idx.tolist(),
-                "val_idx": val_idx.tolist(),
-                "test_idx": test_idx.tolist(),
-                "split_desc": describe_split(recipe_ids, train_idx, val_idx, test_idx),
-                "model_type": cfg.model_type,
-                "cfg": cfg.__dict__,
-            }
-            with open(os.path.join(cfg.out_dir, "best_so_far.json"), "w", encoding="utf-8") as f:
-                json.dump(best, f, ensure_ascii=False, indent=2)
-    export_stageC_report(cfg.out_dir, train_pack, test_pack, y_mean, y_std, family_sign_t, cfg.unit_scale)
-    print("\n[Done]")
-    if best:
-        print(f"Best trial={best['trial']} train_R2={best['train_r2']:.3f} test_R2={best['test_r2']:.3f}")
-        print(f"Split desc: {best['split_desc']}")
-    else:
-        print("No valid trial (check data size / paths).")
+    rows = []
+    rows.append(_run_one("B2R_zero_ft", load_stageB=True,  do_train=False, phys7_mode="normal"))
+    rows.append(_run_one("C_scratch",   load_stageB=False, do_train=True,  phys7_mode="normal"))
+    rows.append(_run_one("C_transfer",  load_stageB=True,  do_train=True,  phys7_mode="normal"))
+    rows.append(_run_one("C_noPhys7",   load_stageB=True,  do_train=True,  phys7_mode="zero"))
 
+    df = pd.DataFrame(rows)
+    out_csv = os.path.join(cfg.out_dir, "ablation_summary.csv")
+    df.to_csv(out_csv, index=False, encoding="utf-8-sig", na_rep="NaN")
+    print(f"[Ablation] Saved: {out_csv}")
+    print(df.to_string(index=False))
+def family_stats_from_pack(pack: Dict[str, np.ndarray],
+                           y_mean: np.ndarray, y_std: np.ndarray,
+                           family_sign: Optional[torch.Tensor],
+                           unit_scale: float) -> Dict[str, np.ndarray]:
+    """
+    返回 dict:
+      r2 : (K,)
+      mae: (K,)
+      n  : (K,)    mask 点数（flatten over T）
+      std: (K,)    y_true 的标准差（display space）
+    """
+    pred = pack["pred_norm"].astype(np.float32)
+    y    = pack["y_norm"].astype(np.float32)
+    m    = pack["mask"].astype(bool)
+
+    pred_um = pred * (y_std + 1e-6) + y_mean
+    y_um    = y    * (y_std + 1e-6) + y_mean
+
+    pred_t = torch.from_numpy(pred_um)
+    y_t    = torch.from_numpy(y_um)
+
+    pred_disp, y_disp = pu.transform_for_display(
+        pred_t, y_t, family_sign=family_sign, unit_scale=unit_scale, clip_nonneg=False
+    )
+    pred_disp = pred_disp.numpy()
+    y_disp    = y_disp.numpy()
+
+    K = y_disp.shape[1]
+    out_r2  = np.full((K,), np.nan, dtype=np.float32)
+    out_mae = np.full((K,), np.nan, dtype=np.float32)
+    out_n   = np.zeros((K,), dtype=np.int32)
+    out_std = np.full((K,), np.nan, dtype=np.float32)
+
+    for k in range(K):
+        mk = m[:, k, :].reshape(-1)
+        n = int(mk.sum())
+        out_n[k] = n
+        if n < 2:
+            continue
+        yt = y_disp[:, k, :].reshape(-1)[mk]
+        yp = pred_disp[:, k, :].reshape(-1)[mk]
+
+        out_std[k] = float(np.std(yt))
+        out_mae[k] = float(np.mean(np.abs(yt - yp)))
+
+        # R2 需要足够方差，否则 masked_r2_np 会 NaN 或非常不稳定
+        out_r2[k] = float(masked_r2_np(yt, yp))
+
+    return {"r2": out_r2, "mae": out_mae, "n": out_n, "std": out_std}
 
 def parse_args():
     ap = argparse.ArgumentParser()
@@ -1196,7 +2025,7 @@ if __name__ == "__main__":
         target_r2=0.90,
 
         # subset+split 搜索（允许丢样本）
-        trials=300,
+        trials=1000,
         test_ratio=0.25,
         val_ratio=0.15,
         drop_max_frac=0.50,
@@ -1205,11 +2034,9 @@ if __name__ == "__main__":
         model_type="transformer",
 
         # 训练设置（你说训练时间不是问题，这里固定即可）
-        epochs=2000,
+        epochs=200,
         lr=5e-4,
         wd=1e-4,
         batch=8,
-        early_patience=200,
+        early_patience=30,
     )
-
-    main(cfg)

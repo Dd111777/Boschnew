@@ -4,14 +4,10 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="089379c4-7cfb-4299-905f-3a8550c713ee" name="更改" comment="12.">
-      <change afterPath="$PROJECT_DIR$/stageA_train_phys_pycharm_old.py" afterDir="false" />
+    <list default="true" id="089379c4-7cfb-4299-905f-3a8550c713ee" name="更改" comment="1.5">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/Bosch.xlsx" beforeDir="false" afterPath="$PROJECT_DIR$/Bosch.xlsx" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/case.xlsx" beforeDir="false" afterPath="$PROJECT_DIR$/case.xlsx" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/extract_phys7_from_iedf.py" beforeDir="false" afterPath="$PROJECT_DIR$/extract_phys7_from_iedf.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/phys_model.py" beforeDir="false" afterPath="$PROJECT_DIR$/phys_model.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/physio_util.py" beforeDir="false" afterPath="$PROJECT_DIR$/physio_util.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/stageA_train_phys_pycharm.py" beforeDir="false" afterPath="$PROJECT_DIR$/stageA_train_phys_pycharm.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/stageC_finetune_joint_on_new_pycharm.py" beforeDir="false" afterPath="$PROJECT_DIR$/stageC_finetune_joint_on_new_pycharm.py" afterDir="false" />
     </list>
@@ -66,6 +62,7 @@
     "Python.build_pca_features_from_iedf.executor": "Run",
     "Python.extract_phys7_from_iedf.executor": "Run",
     "Python.plasma.executor": "Run",
+    "Python.reachability_single_family_test.executor": "Run",
     "Python.sss.executor": "Run",
     "Python.stageA_train_phys_pycharm.executor": "Run",
     "Python.stageB_train_morph_on_phys7_pycharm.executor": "Run",
@@ -195,7 +192,15 @@
       <option name="project" value="LOCAL" />
       <updated>1765783874732</updated>
     </task>
-    <option name="localTasksCounter" value="13" />
+    <task id="LOCAL-00013" summary="1.5">
+      <option name="closed" value="true" />
+      <created>1767618567109</created>
+      <option name="number" value="00013" />
+      <option name="presentableId" value="LOCAL-00013" />
+      <option name="project" value="LOCAL" />
+      <updated>1767618567109</updated>
+    </task>
+    <option name="localTasksCounter" value="14" />
     <servers />
   </component>
   <component name="Vcs.Log.Tabs.Properties">
@@ -218,7 +223,8 @@
     <MESSAGE value="12.4" />
     <MESSAGE value="12.10" />
     <MESSAGE value="12." />
-    <option name="LAST_COMMIT_MESSAGE" value="12." />
+    <MESSAGE value="1.5" />
+    <option name="LAST_COMMIT_MESSAGE" value="1.5" />
   </component>
   <component name="github-copilot-workspace">
     <instructionFileLocations>
