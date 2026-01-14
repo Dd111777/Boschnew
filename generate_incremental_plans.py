@@ -1,26 +1,8 @@
 # -*- coding: utf-8 -*-
-"""
-增量实验方案生成器：基于统计分析结果的智能采样
-================================================
-
-根据statistical_analysis.xlsx的结果，生成3种规模的实验方案：
-- 方案A：10个样本（¥20k预算）
-- 方案B：20个样本（¥40k预算）
-- 方案C：30个样本（¥60k预算）
-
-策略：
-1. 覆盖旧数据的关键区域
-2. 避开新数据集中的区域（TEMP≈-13, APC≈25等）
-3. 优先采样高变异参数（Cohen's d大的）
-4. 确保每个参数至少有3个不同水平
-"""
 
 import numpy as np
 import pandas as pd
 from scipy.spatial.distance import cdist
-
-# ============ 基于统计分析的参数范围 ============
-# 从statistical_analysis.xlsx提取
 
 PARAM_RANGES = {
     'TEMP': {

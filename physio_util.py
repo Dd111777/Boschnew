@@ -559,7 +559,6 @@ def excel_to_phys7_dataset_from_iedf(excel_path: str, sheet_name=None,
     import numpy as np, torch
     import pandas as pd
     from torch.utils.data import TensorDataset
-    from extract_phys7_from_iedf import compute_phys7_for_case, normalize_case_id
 
     df = pd.read_excel(excel_path, sheet_name=sheet_name)
     cols = list(df.columns)
