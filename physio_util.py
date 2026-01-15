@@ -20,6 +20,8 @@ from typing import Dict, List, Tuple
 import torch
 from torch.utils.data import TensorDataset, DataLoader
 
+from build_pca_features_from_iedf import normalize_case_id
+
 # ---------------- 基本配置 ----------------
 FAMILIES = ["zmin", "h0", "h1", "d0", "d1", "w"]
 TIME_LIST = ["1","2","3","4","5","6","7","8","9","9_2"]
@@ -256,7 +258,7 @@ def excel_to_morph_dataset_from_old(excel_path: str, sheet_name=None):
     return ds, meta
 
 # --------------- C：新表→稀疏形貌监督 ----------------
-def load_new_excel_as_sparse_morph(new_excel: str, height_family="h1") -> List[Dict]:
+def load_new_excel_as_sparse_morph1(new_excel: str, height_family="h1") -> List[Dict]:
     df = pd.read_excel(new_excel)
     def col_like(name: str) -> str:
         can = _canon(name)
@@ -271,10 +273,10 @@ def load_new_excel_as_sparse_morph(new_excel: str, height_family="h1") -> List[D
     recs = []
     for i in range(len(df)):
         tg: Dict[Tuple[str,str], float] = {}
-        # Zmin_9_2
+        # Zmin_9
         try:
             total_depth_nm = float(df.iloc[i][col_like("总深度")])
-            tg[("zmin","9_2")] = -abs(total_depth_nm*nm2um)
+            tg[("zmin","9")] = -abs(total_depth_nm*nm2um)
         except Exception: pass
         # w*
         mapping_w = {("w","1"):"开口处CD",("w","3"):"第三个scallops的宽度",
@@ -319,6 +321,138 @@ def load_new_excel_as_sparse_morph(new_excel: str, height_family="h1") -> List[D
 
     return recs
 
+
+def load_new_excel_as_sparse_morph(excel_path: str, height_family="h1") -> List[Dict]:
+    """
+    读取新版 Excel，强力匹配中文列名。
+    返回 sparse 格式：[{ "static": [...], "targets": {("zmin","9"): ...} }, ...]
+    """
+    if excel_path.endswith(".csv"):
+        df = pd.read_csv(excel_path)
+    else:
+        df = pd.read_excel(excel_path)
+
+    cols = df.columns
+    print(f"\n[PhysioUtil] Loading Data from: {excel_path}")
+    print(f"[PhysioUtil] Total Rows: {len(df)}")
+
+    # 辅助函数：模糊匹配列名
+    def col_like(kw):
+        # 1. 优先完全匹配
+        for c in cols:
+            if kw == str(c).strip(): return c
+        # 2. 其次包含匹配
+        for c in cols:
+            if kw in str(c): return c
+        return None
+
+    # 1. 确定 7 个静态输入列 (Recipe)
+    recipe_keys = ["APC", "source", "LF", "SF6", "C4F8", "DEP", "etch"]
+    col_map = {}
+    for k in recipe_keys:
+        found = col_like(k)
+        if not found:
+            # 兼容别名
+            if k == "source": found = col_like("source_RF")
+            if k == "LF": found = col_like("LF_RF")
+            if k == "DEP": found = col_like("DEP time")
+            if k == "etch": found = col_like("etch time")
+        col_map[k] = found
+
+    recs = []
+    nm2um = 0.001
+
+    # 统计有效数据量，方便调试
+    cnt_valid = {"zmin": 0, "d1": 0, "w": 0, "h1": 0}
+
+    for i in range(len(df)):
+        # --- A. 读取 Static Recipe ---
+        static_vals = []
+        try:
+            for k in recipe_keys:
+                c = col_map[k]
+                if c:
+                    val = float(df.iloc[i][c])
+                else:
+                    val = 0.0
+                static_vals.append(val)
+        except:
+            continue  # 跳过无效行
+
+        # --- B. 读取 Targets ---
+        tg: Dict[Tuple[str, str], float] = {}
+
+        # 1. Zmin (总深度) -> 强制映射到 t=9
+        c_zmin = col_like("总深度")
+        if c_zmin:
+            try:
+                val = df.iloc[i][c_zmin]
+                if pd.notna(val):
+                    s_val = str(val).strip()
+                    if s_val and s_val not in ["-", "NA", "nan", ""]:
+                        # 深度通常定义为负值
+                        tg[("zmin", "9")] = -abs(float(val) * nm2um)
+                        cnt_valid["zmin"] += 1
+            except:
+                pass
+
+        # 2. W (宽度) - 映射中文列名
+        w_map = {
+            "1": "开口处CD",
+            "3": "第三个scallops的宽度",
+            "5": "第五个scallops的宽度",
+            "9": "最后一个scallops的宽度"
+        }
+        for t_code, key_cn in w_map.items():
+            c = col_like(key_cn)
+            if c:
+                try:
+                    val = df.iloc[i][c]
+                    if pd.notna(val) and str(val).strip() not in ["-", "NA", ""]:
+                        tg[("w", t_code)] = float(val) * nm2um
+                        cnt_valid["w"] += 1
+                except:
+                    pass
+
+        # 3. D (深度)
+        d_map = {
+            "3": "第三个scallops的深度",
+            "5": "第五个scallops的深度",
+            "9": "最后一个scallops的深度"
+        }
+        for t_code, key_cn in d_map.items():
+            c = col_like(key_cn)
+            if c:
+                try:
+                    val = df.iloc[i][c]
+                    # 过滤掉 0 值，防止 Log 报错
+                    if pd.notna(val) and float(val) != 0 and str(val).strip() not in ["-", "NA", ""]:
+                        tg[("d1", t_code)] = float(val) * nm2um
+                        cnt_valid["d1"] += 1
+                except:
+                    pass
+
+        # 4. H (高度)
+        h_map = {
+            "3": "第三个scallops的高度",
+            "5": "第五个scallops的高度",
+            "9": "最后一个scallops的高度"
+        }
+        for t_code, key_cn in h_map.items():
+            c = col_like(key_cn)
+            if c:
+                try:
+                    val = df.iloc[i][c]
+                    if pd.notna(val) and str(val).strip() not in ["-", "NA", ""]:
+                        tg[(height_family, t_code)] = float(val) * nm2um
+                        cnt_valid["h1"] += 1
+                except:
+                    pass
+
+        recs.append({"static": static_vals, "targets": tg})
+
+    print(f"[PhysioUtil] Valid Targets Count: {cnt_valid}")
+    return recs
 
 def build_sparse_batch(recs: List[Dict], norm_static_mean, norm_static_std, time_values):
     B = len(recs);
