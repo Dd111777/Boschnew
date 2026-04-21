@@ -68,31 +68,3 @@ Boschnew/
 └── stageC_finetune_joint.py
 ```
 
-## Quick Start
-
-### 1. Extract Phys7 descriptors
-
-```bash
-python extract_phys7_from_iedf.py
-```
-
-### 2. Train Stage A
-
-```bash
-python stageA_train_phys_pycharm.py
-```
-
-### 3. Train Stage B
-
-```bash
-python stageB_train_morph_on_phys7_pycharm.py
-```
-
-### 4. Fine-tune Stage C
-
-```bash
-python stageC_finetune_joint.py
-```
-
-
-我也可以直接再给你一版**更像论文配套开源仓库的极简版**，控制在 25 行左右。
